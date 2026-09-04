@@ -14,14 +14,15 @@ import (
 )
 
 type processList struct {
-	all         []model.ProcessInfo
-	visible     []model.ProcessInfo
-	selected    int
-	viewTop     int
-	query       string
-	searching   bool
-	searchInput textinput.Model
-	metrics     map[string]model.ProcessMetrics
+	all            []model.ProcessInfo
+	visible        []model.ProcessInfo
+	selected       int
+	viewTop        int
+	query          string
+	searching      bool
+	searchInput    textinput.Model
+	searchOriginal string
+	metrics        map[string]model.ProcessMetrics
 }
 
 func newProcessList() processList {
@@ -65,14 +66,21 @@ func (l *processList) SetMetrics(values []model.ProcessMetrics) {
 
 func (l *processList) BeginSearch() {
 	l.searching = true
+	l.searchOriginal = l.query
 	l.searchInput.SetValue(l.query)
 	l.searchInput.SetCursor(len([]rune(l.query)))
 	l.searchInput.Focus()
 }
 
+func (l *processList) UpdateSearch(value string) {
+	selectedID := l.SelectedID()
+	l.query = strings.TrimSpace(value)
+	l.applyFilter(selectedID)
+}
+
 func (l *processList) EndSearch(commit bool) {
-	if commit {
-		l.query = strings.TrimSpace(l.searchInput.Value())
+	if !commit {
+		l.query = l.searchOriginal
 	}
 	l.searching = false
 	l.searchInput.Blur()

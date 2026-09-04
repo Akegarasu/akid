@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -140,6 +141,54 @@ func TestModelIgnoresStaleLogMessages(t *testing.T) {
 	m = updated.(Model)
 	if cmd != nil || len(m.logs.Buffer.Lines) != 0 {
 		t.Fatal("stale log read changed the model")
+	}
+}
+
+func TestProcessDetailScrollsLongEnvironment(t *testing.T) {
+	info := processInfo("api", "1")
+	info.Config.Env = make(map[string]string)
+	for i := 0; i < 20; i++ {
+		info.Config.Env[fmt.Sprintf("KEY_%02d", i)] = "value"
+	}
+	m := NewModel(context.Background(), &fakeClient{})
+	m.width, m.height = 80, 12
+	m.detail, m.view = info, viewProcessDetail
+	updated, _ := m.Update(keyText("G"))
+	m = updated.(Model)
+	if m.detailTop == 0 || m.detailTop != m.detailMaxTop() {
+		t.Fatalf("detail did not scroll to end: top=%d max=%d", m.detailTop, m.detailMaxTop())
+	}
+	updated, _ = m.Update(keyText("g"))
+	m = updated.(Model)
+	if m.detailTop != 0 {
+		t.Fatalf("detail did not scroll home: %d", m.detailTop)
+	}
+}
+
+func TestOptionalMouseSelectsProcessAndLogLine(t *testing.T) {
+	first := processInfo("api", "1")
+	second := processInfo("worker", "2")
+	m := NewModel(context.Background(), &fakeClient{}, Options{Mouse: true})
+	m.width, m.height = 80, 18
+	m.processes.Set([]model.ProcessInfo{first, second})
+	if m.View().MouseMode != tea.MouseModeCellMotion {
+		t.Fatal("mouse mode was not enabled")
+	}
+
+	updated, _ := m.Update(tea.MouseClickMsg(tea.Mouse{X: 2, Y: 3, Button: tea.MouseLeft}))
+	m = updated.(Model)
+	selected, ok := m.processes.Selected()
+	if !ok || selected.Config.Name != "worker" {
+		t.Fatalf("mouse selected %#v", selected)
+	}
+
+	m.view = viewLogs
+	m.logs.Reset(first, model.LogStdout)
+	m.logs.Buffer.Reset(chunk(0, 1, "one\ntwo\nthree\n"), true)
+	updated, _ = m.Update(tea.MouseClickMsg(tea.Mouse{X: 1, Y: 2, Button: tea.MouseLeft}))
+	m = updated.(Model)
+	if m.logs.Buffer.CursorLine != 1 || m.logs.Buffer.CursorCol != 1 || m.logs.Buffer.Follow {
+		t.Fatalf("log click cursor=%d:%d follow=%v", m.logs.Buffer.CursorLine, m.logs.Buffer.CursorCol, m.logs.Buffer.Follow)
 	}
 }
 

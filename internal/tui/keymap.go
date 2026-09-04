@@ -23,6 +23,7 @@ func (m Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		var cmd tea.Cmd
 		m.processes.searchInput, cmd = m.processes.searchInput.Update(msg)
+		m.processes.UpdateSearch(m.processes.searchInput.Value())
 		return m, cmd
 	}
 	if m.view == viewLogs && m.logs.Searching {
@@ -75,6 +76,7 @@ func (m Model) handleProcessKey(key string) (tea.Model, tea.Cmd) {
 	case "i", "tab":
 		if info, ok := m.processes.Selected(); ok {
 			m.detail = info
+			m.detailTop = 0
 			m.view = viewProcessDetail
 		}
 	case "a", "r", "s":
@@ -84,11 +86,24 @@ func (m Model) handleProcessKey(key string) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleDetailKey(key string) (tea.Model, tea.Cmd) {
+	bodyHeight := max(1, m.height-3)
 	switch key {
 	case "q":
 		return m, tea.Quit
 	case "esc":
 		m.view = viewProcesses
+	case "up", "k":
+		m.detailTop = max(0, m.detailTop-1)
+	case "down", "j":
+		m.detailTop = min(m.detailMaxTop(), m.detailTop+1)
+	case "pgup":
+		m.detailTop = max(0, m.detailTop-bodyHeight)
+	case "pgdown":
+		m.detailTop = min(m.detailMaxTop(), m.detailTop+bodyHeight)
+	case "home", "g":
+		m.detailTop = 0
+	case "end", "G":
+		m.detailTop = m.detailMaxTop()
 	case "enter", "l":
 		return m.openLogs(m.detail, model.LogStdout)
 	case "a":

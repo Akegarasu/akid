@@ -10,13 +10,43 @@ import (
 	"akid/internal/model"
 )
 
-func renderProcessDetail(info model.ProcessInfo, metric model.ProcessMetrics, width, height int, now time.Time, status string, statusError bool) string {
+func renderProcessDetail(info model.ProcessInfo, metric model.ProcessMetrics, top, width, height int, now time.Time, status string, statusError bool) string {
 	if width < 1 {
 		width = 1
 	}
 	if height < 3 {
 		height = 3
 	}
+	rows := processDetailRows(info, metric, width, now)
+	bodyHeight := max(1, height-3)
+	top = clamp(top, 0, max(0, len(rows)-bodyHeight))
+	end := min(len(rows), top+bodyHeight)
+	visible := append([]string(nil), rows[top:end]...)
+	for len(visible) < bodyHeight {
+		visible = append(visible, "")
+	}
+
+	title := "Process: " + info.Config.Name
+	if len(rows) > bodyHeight {
+		title += fmt.Sprintf("  [%d-%d/%d]", top+1, end, len(rows))
+	}
+	message := ""
+	if status != "" {
+		style := successStyle
+		if statusError {
+			style = errorStyle
+		}
+		message = style.Render(status)
+	}
+	return strings.Join([]string{
+		renderHeader(title, width),
+		strings.Join(visible, "\n"),
+		statusStyle.Width(width).MaxWidth(width).Render(message),
+		renderFooter("↑↓/jk scroll  l/Enter logs  a start  r restart  s stop  Esc back", width),
+	}, "\n")
+}
+
+func processDetailRows(info model.ProcessInfo, metric model.ProcessMetrics, width int, now time.Time) []string {
 	pid := "-"
 	if info.Runtime.PID > 0 {
 		pid = strconv.Itoa(info.Runtime.PID)
@@ -60,28 +90,13 @@ func renderProcessDetail(info model.ProcessInfo, metric model.ProcessMetrics, wi
 	if len(keys) == 0 {
 		rows = append(rows, subtleStyle.Render("(inherited environment only)"))
 	}
+	return rows
+}
 
-	bodyHeight := max(1, height-3)
-	if len(rows) > bodyHeight {
-		rows = rows[:bodyHeight]
-	}
-	for len(rows) < bodyHeight {
-		rows = append(rows, "")
-	}
-	message := ""
-	if status != "" {
-		style := successStyle
-		if statusError {
-			style = errorStyle
-		}
-		message = style.Render(status)
-	}
-	return strings.Join([]string{
-		renderHeader("Process: "+info.Config.Name, width),
-		strings.Join(rows, "\n"),
-		statusStyle.Width(width).MaxWidth(width).Render(message),
-		renderFooter("l/Enter logs  a start  r restart  s stop  Esc back", width),
-	}, "\n")
+func (m Model) detailMaxTop() int {
+	bodyHeight := max(1, m.height-3)
+	metric := m.processes.metrics[m.detail.Config.ID]
+	return max(0, len(processDetailRows(m.detail, metric, max(1, m.width), m.now))-bodyHeight)
 }
 
 func detailRow(label, value string, width int) string {

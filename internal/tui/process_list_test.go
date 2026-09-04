@@ -6,6 +6,22 @@ import (
 	"akid/internal/model"
 )
 
+func TestProcessListLiveSearchCanBeCanceled(t *testing.T) {
+	list := newProcessList()
+	list.Set([]model.ProcessInfo{processInfo("api", "1"), processInfo("worker", "2")})
+	list.query = "api"
+	list.applyFilter("")
+	list.BeginSearch()
+	list.UpdateSearch("worker")
+	if len(list.visible) != 1 || list.visible[0].Config.Name != "worker" {
+		t.Fatalf("live search result: %#v", list.visible)
+	}
+	list.EndSearch(false)
+	if list.query != "api" || len(list.visible) != 1 || list.visible[0].Config.Name != "api" {
+		t.Fatalf("cancel did not restore filter: query=%q visible=%#v", list.query, list.visible)
+	}
+}
+
 func TestProcessListSortFilterAndPreserveSelection(t *testing.T) {
 	list := newProcessList()
 	list.Set([]model.ProcessInfo{

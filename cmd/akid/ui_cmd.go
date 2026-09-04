@@ -6,7 +6,8 @@ import (
 )
 
 func newUICommand(app *application) *cobra.Command {
-	return &cobra.Command{
+	var mouse bool
+	cmd := &cobra.Command{
 		Use:   "ui",
 		Short: "Open the interactive terminal interface",
 		Args:  cobra.NoArgs,
@@ -15,7 +16,9 @@ func newUICommand(app *application) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return tui.Run(cmd.Context(), client, app.out)
+			return tui.Run(cmd.Context(), client, app.out, tui.Options{Mouse: mouse})
 		},
 	}
+	cmd.Flags().BoolVar(&mouse, "mouse", false, "capture mouse clicks and wheel events")
+	return cmd
 }

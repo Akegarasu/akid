@@ -21,6 +21,10 @@ const (
 	viewLogs
 )
 
+type Options struct {
+	Mouse bool
+}
+
 type Model struct {
 	ctx    context.Context
 	client Client
@@ -31,6 +35,7 @@ type Model struct {
 	now       time.Time
 	processes processList
 	detail    model.ProcessInfo
+	detailTop int
 	logs      LogViewer
 
 	status      string
@@ -44,11 +49,16 @@ type Model struct {
 	logGeneration  uint64
 	metricsPending bool
 	lastSelection  string
+	mouseEnabled   bool
 }
 
-func NewModel(ctx context.Context, client Client) Model {
+func NewModel(ctx context.Context, client Client, options ...Options) Model {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	var opts Options
+	if len(options) > 0 {
+		opts = options[0]
 	}
 	return Model{
 		ctx:            ctx,
@@ -57,13 +67,14 @@ func NewModel(ctx context.Context, client Client) Model {
 		processes:      newProcessList(),
 		logs:           NewLogViewer(),
 		metricsPending: true,
+		mouseEnabled:   opts.Mouse,
 	}
 }
 
-func Run(ctx context.Context, client Client, output io.Writer) error {
+func Run(ctx context.Context, client Client, output io.Writer, options Options) error {
 	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	program := tea.NewProgram(NewModel(runCtx, client), tea.WithContext(runCtx), tea.WithOutput(output))
+	program := tea.NewProgram(NewModel(runCtx, client, options), tea.WithContext(runCtx), tea.WithOutput(output))
 	_, err := program.Run()
 	if errors.Is(err, tea.ErrInterrupted) || (errors.Is(err, tea.ErrProgramKilled) && ctx.Err() != nil) {
 		return nil
@@ -86,7 +97,7 @@ func (m Model) View() tea.View {
 	var content string
 	switch m.view {
 	case viewProcessDetail:
-		content = renderProcessDetail(m.detail, m.processes.metrics[m.detail.Config.ID], width, height, m.now, m.status, m.statusError)
+		content = renderProcessDetail(m.detail, m.processes.metrics[m.detail.Config.ID], m.detailTop, width, height, m.now, m.status, m.statusError)
 	case viewLogs:
 		content = m.logs.Render(width, height, m.status, m.statusError)
 	default:
@@ -95,6 +106,9 @@ func (m Model) View() tea.View {
 	view := tea.NewView(content)
 	view.AltScreen = true
 	view.WindowTitle = "akid"
+	if m.mouseEnabled {
+		view.MouseMode = tea.MouseModeCellMotion
+	}
 	return view
 }
 

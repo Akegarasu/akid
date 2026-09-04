@@ -12,6 +12,9 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := message.(type) {
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
+		m.processes.ensureVisible(max(1, m.height-4))
+		m.detailTop = min(m.detailTop, m.detailMaxTop())
+		m.logs.Buffer.ensureVisible(m.logBodyHeight())
 		return m, nil
 	case processesLoadedMsg:
 		if msg.err != nil {
@@ -116,6 +119,14 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, loadMetricsCmd(m.ctx, m.client))
 		}
 		return m, tea.Batch(cmds...)
+	case tea.MouseWheelMsg:
+		if m.mouseEnabled {
+			return m.handleMouse(msg)
+		}
+	case tea.MouseClickMsg:
+		if m.mouseEnabled {
+			return m.handleMouse(msg)
+		}
 	case tea.KeyPressMsg:
 		return m.handleKey(msg)
 	}
@@ -127,6 +138,7 @@ func (m *Model) syncCurrentProcess() {
 		for _, info := range m.processes.all {
 			if info.Config.ID == m.detail.Config.ID {
 				m.detail = info
+				m.detailTop = min(m.detailTop, m.detailMaxTop())
 				return
 			}
 		}
@@ -144,6 +156,7 @@ func (m *Model) syncCurrentProcess() {
 func (m *Model) updateCurrentProcess(info model.ProcessInfo) {
 	if m.view == viewProcessDetail && m.detail.Config.ID == info.Config.ID {
 		m.detail = info
+		m.detailTop = min(m.detailTop, m.detailMaxTop())
 	}
 	if m.view == viewLogs && m.logs.Process.Config.ID == info.Config.ID {
 		m.logs.Process = info

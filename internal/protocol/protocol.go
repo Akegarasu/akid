@@ -112,20 +112,24 @@ func (c *Client) Call(ctx context.Context, method string, params any, result any
 
 func (c *Client) SubscribeEvents(ctx context.Context) (<-chan model.Event, error) {
 	out := make(chan model.Event, 1024)
-	conn, scanner, err := c.openSubscription(ctx, "event.subscribe", nil)
+	conn, scanner, stopContextWatch, err := c.openSubscription(ctx, "event.subscribe", nil)
 	if err != nil {
 		return nil, err
 	}
 	go func() {
 		defer close(out)
 		defer conn.Close()
+		defer stopContextWatch()
 		for scanner.Scan() {
 			var envelope EventEnvelope
 			if json.Unmarshal(scanner.Bytes(), &envelope) != nil {
 				return
 			}
 			if envelope.Event == "event.lagged" {
-				out <- model.Event{Name: "event.lagged"}
+				select {
+				case out <- model.Event{Name: "event.lagged"}:
+				case <-ctx.Done():
+				}
 				return
 			}
 			var info model.ProcessInfo
@@ -151,20 +155,24 @@ type LogSubscribeParams struct {
 
 func (c *Client) SubscribeLogs(ctx context.Context, params LogSubscribeParams) (<-chan logging.LogEvent, error) {
 	out := make(chan logging.LogEvent, 1024)
-	conn, scanner, err := c.openSubscription(ctx, "log.subscribe", params)
+	conn, scanner, stopContextWatch, err := c.openSubscription(ctx, "log.subscribe", params)
 	if err != nil {
 		return nil, err
 	}
 	go func() {
 		defer close(out)
 		defer conn.Close()
+		defer stopContextWatch()
 		for scanner.Scan() {
 			var envelope EventEnvelope
 			if json.Unmarshal(scanner.Bytes(), &envelope) != nil {
 				return
 			}
 			if envelope.Event == "event.lagged" {
-				out <- logging.LogEvent{Lagged: true}
+				select {
+				case out <- logging.LogEvent{Lagged: true}:
+				case <-ctx.Done():
+				}
 				return
 			}
 			if envelope.Event != "log.append" {
@@ -184,33 +192,34 @@ func (c *Client) SubscribeLogs(ctx context.Context, params LogSubscribeParams) (
 	return out, nil
 }
 
-func (c *Client) openSubscription(ctx context.Context, method string, params any) (net.Conn, *bufio.Scanner, error) {
+func (c *Client) openSubscription(ctx context.Context, method string, params any) (net.Conn, *bufio.Scanner, func(), error) {
 	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", c.Socket)
 	if err != nil {
-		return nil, nil, err
+		return nil, nil, nil, err
 	}
 	stopCancel := context.AfterFunc(ctx, func() { _ = conn.Close() })
+	cleanup := func() {
+		stopCancel()
+		_ = conn.Close()
+	}
 	id := c.nextID.Add(1)
 	idJSON, _ := json.Marshal(id)
 	paramsJSON, err := marshalParams(params)
 	if err != nil {
-		stopCancel()
-		conn.Close()
-		return nil, nil, err
+		cleanup()
+		return nil, nil, nil, err
 	}
 	if err := WriteMessage(conn, Request{Protocol: Version, ID: idJSON, Method: method, Params: paramsJSON}); err != nil {
-		stopCancel()
-		conn.Close()
-		return nil, nil, err
+		cleanup()
+		return nil, nil, nil, err
 	}
 	scanner := NewScanner(conn)
 	if !scanner.Scan() {
-		stopCancel()
-		conn.Close()
+		cleanup()
 		if scanner.Err() != nil {
-			return nil, nil, scanner.Err()
+			return nil, nil, nil, scanner.Err()
 		}
-		return nil, nil, errors.New("daemon closed subscription")
+		return nil, nil, nil, errors.New("daemon closed subscription")
 	}
 	var response struct {
 		Protocol int             `json:"protocol"`
@@ -218,26 +227,22 @@ func (c *Client) openSubscription(ctx context.Context, method string, params any
 		Error    *WireError      `json:"error"`
 	}
 	if err := json.Unmarshal(scanner.Bytes(), &response); err != nil {
-		stopCancel()
-		conn.Close()
-		return nil, nil, err
+		cleanup()
+		return nil, nil, nil, err
 	}
 	if response.Protocol != Version {
-		stopCancel()
-		conn.Close()
-		return nil, nil, fmt.Errorf("unsupported daemon protocol %d", response.Protocol)
+		cleanup()
+		return nil, nil, nil, fmt.Errorf("unsupported daemon protocol %d", response.Protocol)
 	}
 	if !bytes.Equal(bytes.TrimSpace(response.ID), idJSON) {
-		stopCancel()
-		conn.Close()
-		return nil, nil, errors.New("daemon response id mismatch")
+		cleanup()
+		return nil, nil, nil, errors.New("daemon response id mismatch")
 	}
 	if response.Error != nil {
-		stopCancel()
-		conn.Close()
-		return nil, nil, &RemoteError{Code: response.Error.Code, Message: response.Error.Message}
+		cleanup()
+		return nil, nil, nil, &RemoteError{Code: response.Error.Code, Message: response.Error.Message}
 	}
-	return conn, scanner, nil
+	return conn, scanner, func() { stopCancel() }, nil
 }
 
 func marshalParams(params any) (json.RawMessage, error) {

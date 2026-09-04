@@ -137,6 +137,15 @@ type ProcessInfo struct {
 	ErrGeneration uint64        `json:"err_generation"`
 }
 
+type ProcessMetrics struct {
+	ID           string  `json:"id"`
+	PID          int     `json:"pid,omitempty"`
+	CPUPercent   float64 `json:"cpu_percent,omitempty"`
+	MemoryBytes  uint64  `json:"memory_bytes,omitempty"`
+	CPUAvailable bool    `json:"cpu_available"`
+	Available    bool    `json:"available"`
+}
+
 type Event struct {
 	Name string      `json:"event"`
 	Data ProcessInfo `json:"data"`

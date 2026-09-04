@@ -11,6 +11,7 @@ import (
 
 	"akid/internal/logging"
 	"akid/internal/manager"
+	"akid/internal/metrics"
 	"akid/internal/model"
 	"akid/internal/protocol"
 )
@@ -19,12 +20,13 @@ type Server struct {
 	listener        net.Listener
 	manager         *manager.Manager
 	logs            *logging.Service
+	metrics         *metrics.Sampler
 	requestShutdown func()
 	closeOnce       sync.Once
 }
 
 func NewServer(listener net.Listener, manager *manager.Manager, logs *logging.Service, requestShutdown func()) *Server {
-	return &Server{listener: listener, manager: manager, logs: logs, requestShutdown: requestShutdown}
+	return &Server{listener: listener, manager: manager, logs: logs, metrics: metrics.NewSampler(), requestShutdown: requestShutdown}
 }
 
 func (s *Server) Serve() error {
@@ -101,6 +103,12 @@ func (s *Server) dispatch(ctx context.Context, req protocol.Request) (any, bool,
 	case "process.list":
 		value, err := s.manager.List(ctx)
 		return value, false, err
+	case "process.metrics":
+		values, err := s.manager.List(ctx)
+		if err != nil {
+			return nil, false, err
+		}
+		return s.metrics.Sample(values), false, nil
 	case "process.get":
 		var params idParams
 		if err := decodeParams(req.Params, &params); err != nil {

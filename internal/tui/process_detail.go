@@ -1,0 +1,92 @@
+package tui
+
+import (
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+
+	"akid/internal/model"
+)
+
+func renderProcessDetail(info model.ProcessInfo, metric model.ProcessMetrics, width, height int, now time.Time, status string, statusError bool) string {
+	if width < 1 {
+		width = 1
+	}
+	if height < 3 {
+		height = 3
+	}
+	pid := "-"
+	if info.Runtime.PID > 0 {
+		pid = strconv.Itoa(info.Runtime.PID)
+	}
+	exitCode := "-"
+	if info.Runtime.ExitCode != nil {
+		exitCode = strconv.Itoa(*info.Runtime.ExitCode)
+	}
+	cpu, memory := "-", "-"
+	if metric.Available && metric.PID == info.Runtime.PID {
+		memory = formatBytes(int64(metric.MemoryBytes))
+		if metric.CPUAvailable {
+			cpu = fmt.Sprintf("%.1f%%", metric.CPUPercent)
+		}
+	}
+	rows := []string{
+		detailRow("Status", statusStyleFor(info).Render(statusText(info)), width),
+		detailRow("Desired", string(info.Desired), width),
+		detailRow("PID", pid, width),
+		detailRow("Uptime", formatUptime(info, now), width),
+		detailRow("CPU", cpu, width),
+		detailRow("Memory", memory, width),
+		detailRow("Restarts", strconv.FormatUint(info.Runtime.RestartCount, 10), width),
+		detailRow("Exit code", exitCode, width),
+		detailRow("Command", info.Config.Command, width),
+		detailRow("Args", strings.Join(info.Config.Args, " "), width),
+		detailRow("CWD", info.Config.Cwd, width),
+		detailRow("Restart", string(info.Config.Restart), width),
+		detailRow("Stop timeout", info.Config.StopTimeout().String(), width),
+		"",
+		titleStyle.Render("Environment"),
+	}
+	keys := make([]string, 0, len(info.Config.Env))
+	for key := range info.Config.Env {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	for _, key := range keys {
+		rows = append(rows, fitCell(fmt.Sprintf("%s=%s", key, info.Config.Env[key]), width))
+	}
+	if len(keys) == 0 {
+		rows = append(rows, subtleStyle.Render("(inherited environment only)"))
+	}
+
+	bodyHeight := max(1, height-3)
+	if len(rows) > bodyHeight {
+		rows = rows[:bodyHeight]
+	}
+	for len(rows) < bodyHeight {
+		rows = append(rows, "")
+	}
+	message := ""
+	if status != "" {
+		style := successStyle
+		if statusError {
+			style = errorStyle
+		}
+		message = style.Render(status)
+	}
+	return strings.Join([]string{
+		renderHeader("Process: "+info.Config.Name, width),
+		strings.Join(rows, "\n"),
+		statusStyle.Width(width).MaxWidth(width).Render(message),
+		renderFooter("l/Enter logs  a start  r restart  s stop  Esc back", width),
+	}, "\n")
+}
+
+func detailRow(label, value string, width int) string {
+	if value == "" {
+		value = "-"
+	}
+	return fitCell(fmt.Sprintf("%-14s %s", label, value), width)
+}

@@ -82,7 +82,23 @@ func TestServerDispatchOverSocket(t *testing.T) {
 	if len(processes) != 1 || processes[0].Config.Name != "api" {
 		t.Fatalf("unexpected list: %#v", processes)
 	}
-	missing := roundTrip(t, conn, scanner, 3, "process.get", map[string]string{"id": "missing"})
+	metricsResponse := roundTrip(t, conn, scanner, 3, "process.metrics", nil)
+	if metricsResponse.Error != nil {
+		t.Fatalf("metrics failed: %#v", metricsResponse.Error)
+	}
+	data, err = json.Marshal(metricsResponse.Result)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var sampled []model.ProcessMetrics
+	if err := json.Unmarshal(data, &sampled); err != nil {
+		t.Fatal(err)
+	}
+	if len(sampled) != 1 || sampled[0].ID != processes[0].Config.ID {
+		t.Fatalf("unexpected metrics: %#v", sampled)
+	}
+
+	missing := roundTrip(t, conn, scanner, 4, "process.get", map[string]string{"id": "missing"})
 	if missing.Error == nil || missing.Error.Code != manager.CodeNotFound {
 		t.Fatalf("error code was not preserved: %#v", missing.Error)
 	}

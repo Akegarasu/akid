@@ -1,42 +1,67 @@
 package main
 
 import (
+	"bytes"
 	"path/filepath"
 	"testing"
 	"time"
-
-	"akid/internal/model"
 )
 
-func TestParseStartOptionsAroundChildArguments(t *testing.T) {
-	opts, err := parseStart([]string{"python", "worker.py", "--name", "worker", "--restart=on-failure", "--env", "MODE=prod", "--stop-timeout", "10s", "--", "--name", "child-value"})
+func TestStartCommandUsesCobraForFlagsAndChildArguments(t *testing.T) {
+	cmd := newStartCommand(newApplication(&bytes.Buffer{}, &bytes.Buffer{}))
+	err := cmd.ParseFlags([]string{
+		"python", "worker.py",
+		"--name", "worker",
+		"--restart=on-failure",
+		"--env", "MODE=prod",
+		"--stop-timeout", "10s",
+		"--", "--name", "child-value",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if opts.command != "python" || opts.name != "worker" || opts.restart != model.RestartOnFailure || opts.stopTimeout != 10*time.Second {
-		t.Fatalf("unexpected options: %#v", opts)
+	args := cmd.Flags().Args()
+	if len(args) != 4 || args[0] != "python" || args[1] != "worker.py" || args[2] != "--name" || args[3] != "child-value" {
+		t.Fatalf("unexpected positional/child args: %#v", args)
 	}
-	if len(opts.args) != 3 || opts.args[0] != "worker.py" || opts.args[1] != "--name" || opts.args[2] != "child-value" {
-		t.Fatalf("unexpected child args: %#v", opts.args)
+	name, _ := cmd.Flags().GetString("name")
+	restart, _ := cmd.Flags().GetString("restart")
+	stopTimeout, _ := cmd.Flags().GetDuration("stop-timeout")
+	environment, _ := cmd.Flags().GetStringArray("env")
+	if name != "worker" || restart != "on-failure" || stopTimeout != 10*time.Second {
+		t.Fatalf("unexpected flags: name=%q restart=%q stop=%s", name, restart, stopTimeout)
 	}
-	if opts.env["MODE"] != "prod" {
-		t.Fatalf("unexpected env: %#v", opts.env)
+	if len(environment) != 1 || environment[0] != "MODE=prod" {
+		t.Fatalf("unexpected environment flags: %#v", environment)
 	}
 }
 
-func TestParseStartRejectsUnknownOptionBeforeCommand(t *testing.T) {
-	if _, err := parseStart([]string{"--nanme", "api", "./server"}); err == nil {
-		t.Fatal("expected typo in manager option to be rejected")
+func TestStartCommandRejectsUnknownFlags(t *testing.T) {
+	cmd := newStartCommand(newApplication(&bytes.Buffer{}, &bytes.Buffer{}))
+	if err := cmd.ParseFlags([]string{"./server", "--nanme", "api"}); err == nil {
+		t.Fatal("expected unknown flag to be rejected")
 	}
-	if _, err := parseStart([]string{"./server", "--port", "8080", "--name", "api"}); err == nil {
-		t.Fatal("expected child flag without -- separator to be rejected")
+
+	cmd = newStartCommand(newApplication(&bytes.Buffer{}, &bytes.Buffer{}))
+	if err := cmd.ParseFlags([]string{"./server", "--name", "api", "--", "--port", "8080"}); err != nil {
+		t.Fatal(err)
 	}
-	opts, err := parseStart([]string{"./server", "--name", "api", "--", "--port", "8080"})
+	args := cmd.Flags().Args()
+	if len(args) != 3 || args[1] != "--port" || args[2] != "8080" {
+		t.Fatalf("child flags after -- were not preserved: %#v", args)
+	}
+}
+
+func TestParseEnvironment(t *testing.T) {
+	environment, err := parseEnvironment([]string{"MODE=prod", "EMPTY="})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(opts.args) != 2 || opts.args[0] != "--port" {
-		t.Fatalf("child flags after -- were not preserved: %#v", opts.args)
+	if environment["MODE"] != "prod" || environment["EMPTY"] != "" {
+		t.Fatalf("unexpected environment: %#v", environment)
+	}
+	if _, err := parseEnvironment([]string{"INVALID"}); err == nil {
+		t.Fatal("expected invalid environment error")
 	}
 }
 

@@ -22,8 +22,11 @@ const (
 	MaxReadSize    = 8 << 20
 )
 
+var ErrInvalidRequest = errors.New("invalid log request")
+
 type LogReadRequest struct {
 	Name   string
+	Owner  string
 	Stream model.LogStream
 	Offset int64
 	Limit  int
@@ -165,7 +168,7 @@ func (s *Service) Generation(name string, stream model.LogStream) uint64 {
 
 func (s *Service) Read(req LogReadRequest) (LogChunk, error) {
 	if req.Stream != model.LogStdout && req.Stream != model.LogStderr {
-		return LogChunk{}, errors.New("invalid log stream")
+		return LogChunk{}, fmt.Errorf("%w: stream must be stdout or stderr", ErrInvalidRequest)
 	}
 	if req.Limit <= 0 {
 		req.Limit = 64 << 10
@@ -173,7 +176,7 @@ func (s *Service) Read(req LogReadRequest) (LogChunk, error) {
 	if req.Limit > MaxReadSize {
 		req.Limit = MaxReadSize
 	}
-	state := s.file(req.Name, req.Stream)
+	state := s.file(req.Name, req.Stream, req.Owner)
 	return s.read(req, state)
 }
 
@@ -248,8 +251,11 @@ func (s *Service) read(req LogReadRequest, state *fileState) (LogChunk, error) {
 	}, nil
 }
 
-func (s *Service) Subscribe(ctx context.Context, name string, stream model.LogStream, offset int64, generation uint64) (<-chan LogEvent, error) {
-	state := s.file(name, stream)
+func (s *Service) Subscribe(ctx context.Context, name string, stream model.LogStream, offset int64, generation uint64, owners ...string) (<-chan LogEvent, error) {
+	if stream != model.LogStdout && stream != model.LogStderr || offset < 0 {
+		return nil, fmt.Errorf("%w: stream must be stdout or stderr and subscription offset must be nonnegative", ErrInvalidRequest)
+	}
+	state := s.file(name, stream, owners...)
 	if state == nil {
 		return nil, os.ErrNotExist
 	}
@@ -279,7 +285,7 @@ func (s *Service) Subscribe(ctx context.Context, name string, stream model.LogSt
 					if err != nil {
 						return
 					}
-					if chunk.Generation != currentGeneration {
+					if chunk.Generation != currentGeneration || chunk.StartOffset != cursor {
 						currentGeneration = chunk.Generation
 						cursor = 0
 						// Archives are not part of this stream. Explicitly invalidate
@@ -441,11 +447,14 @@ func (s *Service) rotate(name string, stream model.LogStream) error {
 	return nil
 }
 
-func (s *Service) file(name string, stream model.LogStream) *fileState {
+func (s *Service) file(name string, stream model.LogStream, owners ...string) *fileState {
 	s.mu.RLock()
 	entry := s.entries[name]
 	s.mu.RUnlock()
 	if entry == nil {
+		return nil
+	}
+	if len(owners) > 0 && owners[0] != "" && owners[0] != entry.owner {
 		return nil
 	}
 	if stream == model.LogStderr {

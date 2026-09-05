@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"net"
 	"os"
 	"sync"
+	"time"
 
 	"akid/internal/logging"
 	"akid/internal/manager"
@@ -23,10 +25,22 @@ type Server struct {
 	metrics         *metrics.Sampler
 	requestShutdown func()
 	closeOnce       sync.Once
+	mu              sync.Mutex
+	connections     map[net.Conn]struct{}
+	closed          bool
+	writeTimeout    time.Duration
+	ctx             context.Context
+	cancel          context.CancelFunc
 }
 
 func NewServer(listener net.Listener, manager *manager.Manager, logs *logging.Service, requestShutdown func()) *Server {
-	return &Server{listener: listener, manager: manager, logs: logs, metrics: metrics.NewSampler(), requestShutdown: requestShutdown}
+	ctx, cancel := context.WithCancel(context.Background())
+	return &Server{
+		listener: listener, manager: manager, logs: logs,
+		metrics: metrics.NewSampler(), requestShutdown: requestShutdown,
+		connections: make(map[net.Conn]struct{}), writeTimeout: 5 * time.Second,
+		ctx: ctx, cancel: cancel,
+	}
 }
 
 func (s *Server) Serve() error {
@@ -38,22 +52,49 @@ func (s *Server) Serve() error {
 			}
 			return err
 		}
-		go s.serveConn(conn)
+		s.mu.Lock()
+		if s.closed {
+			s.mu.Unlock()
+			_ = conn.Close()
+			return nil
+		}
+		s.connections[conn] = struct{}{}
+		s.mu.Unlock()
+		go func() {
+			defer func() {
+				s.mu.Lock()
+				delete(s.connections, conn)
+				s.mu.Unlock()
+			}()
+			s.serveConn(conn)
+		}()
 	}
 }
 
 func (s *Server) Close() error {
 	var err error
-	s.closeOnce.Do(func() { err = s.listener.Close() })
+	s.closeOnce.Do(func() {
+		s.mu.Lock()
+		defer s.mu.Unlock()
+		s.closed = true
+		s.cancel()
+		err = s.listener.Close()
+		for conn := range s.connections {
+			_ = conn.Close()
+		}
+	})
 	return err
 }
 
 func (s *Server) serveConn(conn net.Conn) {
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithCancel(s.ctx)
 	defer cancel()
 	defer conn.Close()
 	scanner := protocol.NewScanner(conn)
 	var writeMu sync.Mutex
+	// Bound outstanding requests on a pipelined control connection. Process
+	// lifecycle work is serialized by the manager regardless of this limit.
+	requests := make(chan struct{}, 32)
 	for scanner.Scan() {
 		line := append([]byte(nil), scanner.Bytes()...)
 		var req protocol.Request
@@ -73,20 +114,30 @@ func (s *Server) serveConn(conn net.Conn) {
 			s.serveLogSubscription(ctx, conn, &writeMu, req)
 			return
 		}
+		select {
+		case requests <- struct{}{}:
+		case <-ctx.Done():
+			return
+		}
 		go func(req protocol.Request) {
+			defer func() { <-requests }()
 			result, shouldShutdown, err := s.dispatch(ctx, req)
 			writeMu.Lock()
 			var writeErr error
 			if err != nil {
 				code, message := errorWire(err)
-				writeErr = protocol.WriteMessage(conn, protocol.Response{Protocol: protocol.Version, ID: req.ID, Error: &protocol.WireError{Code: code, Message: message}})
+				writeErr = s.writeMessage(conn, protocol.Response{Protocol: protocol.Version, ID: req.ID, Error: &protocol.WireError{Code: code, Message: message}})
 			} else {
-				writeErr = protocol.WriteMessage(conn, protocol.Response{Protocol: protocol.Version, ID: req.ID, Result: result})
+				writeErr = s.writeMessage(conn, protocol.Response{Protocol: protocol.Version, ID: req.ID, Result: result})
 				if errors.Is(writeErr, protocol.ErrMessageTooLarge) {
-					writeErr = protocol.WriteMessage(conn, protocol.Response{Protocol: protocol.Version, ID: req.ID, Error: &protocol.WireError{Code: "RESPONSE_TOO_LARGE", Message: "response exceeds protocol message limit"}})
+					writeErr = s.writeMessage(conn, protocol.Response{Protocol: protocol.Version, ID: req.ID, Error: &protocol.WireError{Code: "RESPONSE_TOO_LARGE", Message: "response exceeds protocol message limit"}})
 				}
 			}
 			writeMu.Unlock()
+			if writeErr != nil {
+				cancel()
+				_ = conn.Close()
+			}
 			if shouldShutdown && err == nil && writeErr == nil {
 				s.requestShutdown()
 			}
@@ -98,6 +149,18 @@ func (s *Server) dispatch(ctx context.Context, req protocol.Request) (any, bool,
 	switch req.Method {
 	case "daemon.ping":
 		return map[string]any{"pid": os.Getpid(), "version": protocol.Version}, false, nil
+	case "daemon.capabilities":
+		return protocol.SupportedCapabilities(), false, nil
+	case "config.apply":
+		var params protocol.ApplyParams
+		if err := decodeParams(req.Params, &params); err != nil {
+			return nil, false, err
+		}
+		if params.Processes == nil {
+			return nil, false, &manager.Error{Code: manager.CodeInvalidConfig, Message: "processes array is required"}
+		}
+		value, err := s.manager.Apply(ctx, params.Processes)
+		return value, false, err
 	case "daemon.shutdown":
 		return map[string]bool{"accepted": true}, true, nil
 	case "process.list":
@@ -166,7 +229,7 @@ func (s *Server) dispatch(ctx context.Context, req protocol.Request) (any, bool,
 		if err != nil {
 			return nil, false, err
 		}
-		chunk, err := s.logs.Read(logging.LogReadRequest{Name: info.Config.Name, Stream: params.Stream, Offset: params.Offset, Limit: params.Limit, Align: params.Align})
+		chunk, err := s.logs.Read(logging.LogReadRequest{Name: info.Config.Name, Owner: info.Config.ID, Stream: params.Stream, Offset: params.Offset, Limit: params.Limit, Align: params.Align})
 		return chunk, false, err
 	default:
 		return nil, false, &manager.Error{Code: "METHOD_NOT_FOUND", Message: fmt.Sprintf("method %q not found", req.Method)}
@@ -182,7 +245,7 @@ func (s *Server) serveEventSubscription(ctx context.Context, conn net.Conn, writ
 		return
 	}
 	writeMu.Lock()
-	err = protocol.WriteMessage(conn, protocol.Response{Protocol: protocol.Version, ID: req.ID, Result: map[string]bool{"subscribed": true}})
+	err = s.writeMessage(conn, protocol.Response{Protocol: protocol.Version, ID: req.ID, Result: map[string]bool{"subscribed": true}})
 	writeMu.Unlock()
 	if err != nil {
 		return
@@ -195,7 +258,7 @@ func (s *Server) serveEventSubscription(ctx context.Context, conn net.Conn, writ
 			envelope.Data, _ = json.Marshal(event.Data)
 		}
 		writeMu.Lock()
-		err := protocol.WriteMessage(conn, envelope)
+		err := s.writeMessage(conn, envelope)
 		writeMu.Unlock()
 		if err != nil {
 			return
@@ -216,13 +279,13 @@ func (s *Server) serveLogSubscription(ctx context.Context, conn net.Conn, writeM
 		s.writeManagerError(conn, writeMu, req.ID, err)
 		return
 	}
-	events, err := s.logs.Subscribe(subCtx, info.Config.Name, params.Stream, params.Offset, params.Generation)
+	events, err := s.logs.Subscribe(subCtx, info.Config.Name, params.Stream, params.Offset, params.Generation, info.Config.ID)
 	if err != nil {
 		s.writeManagerError(conn, writeMu, req.ID, err)
 		return
 	}
 	writeMu.Lock()
-	err = protocol.WriteMessage(conn, protocol.Response{Protocol: protocol.Version, ID: req.ID, Result: map[string]bool{"subscribed": true}})
+	err = s.writeMessage(conn, protocol.Response{Protocol: protocol.Version, ID: req.ID, Result: map[string]bool{"subscribed": true}})
 	writeMu.Unlock()
 	if err != nil {
 		return
@@ -237,7 +300,7 @@ func (s *Server) serveLogSubscription(ctx context.Context, conn net.Conn, writeM
 		}
 		data, _ := json.Marshal(event)
 		writeMu.Lock()
-		err := protocol.WriteMessage(conn, protocol.EventEnvelope{Protocol: protocol.Version, Event: name, Data: data})
+		err := s.writeMessage(conn, protocol.EventEnvelope{Protocol: protocol.Version, Event: name, Data: data})
 		writeMu.Unlock()
 		if err != nil {
 			return
@@ -263,19 +326,28 @@ type idParams struct {
 }
 
 func decodeParams(data json.RawMessage, target any) error {
-	if len(data) == 0 {
+	if len(data) == 0 || bytes.Equal(bytes.TrimSpace(data), []byte("null")) {
 		return &manager.Error{Code: manager.CodeInvalidConfig, Message: "params are required"}
 	}
-	if err := json.Unmarshal(data, target); err != nil {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(target); err != nil {
 		return &manager.Error{Code: manager.CodeInvalidConfig, Message: "invalid params: " + err.Error()}
 	}
 	return nil
 }
 
+func (s *Server) writeMessage(conn net.Conn, value any) error {
+	if err := conn.SetWriteDeadline(time.Now().Add(s.writeTimeout)); err != nil {
+		return err
+	}
+	return protocol.WriteMessage(conn, value)
+}
+
 func (s *Server) writeError(conn net.Conn, mu *sync.Mutex, id json.RawMessage, code, message string) {
 	mu.Lock()
 	defer mu.Unlock()
-	_ = protocol.WriteMessage(conn, protocol.Response{Protocol: protocol.Version, ID: id, Error: &protocol.WireError{Code: code, Message: message}})
+	_ = s.writeMessage(conn, protocol.Response{Protocol: protocol.Version, ID: id, Error: &protocol.WireError{Code: code, Message: message}})
 }
 
 func (s *Server) writeManagerError(conn net.Conn, mu *sync.Mutex, id json.RawMessage, err error) {
@@ -290,6 +362,9 @@ func errorWire(err error) (string, string) {
 	}
 	if errors.Is(err, os.ErrNotExist) {
 		return "LOG_NOT_FOUND", err.Error()
+	}
+	if errors.Is(err, logging.ErrInvalidRequest) {
+		return manager.CodeInvalidConfig, err.Error()
 	}
 	if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 		return "REQUEST_CANCELED", err.Error()

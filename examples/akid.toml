@@ -1,0 +1,20 @@
+# Relative cwd values resolve against this file's directory.
+# Copy this example, adjust commands/paths, then run akid apply --check FILE.
+
+[[process]]
+name = "api"
+command = "./server"
+args = ["--port", "8080"]
+cwd = "../api"
+restart = "always"
+stop_timeout = "10s"
+
+[process.env]
+APP_ENV = "development"
+
+[[process]]
+name = "worker"
+command = "python3"
+args = ["worker.py"]
+cwd = "../worker"
+restart = "on-failure"

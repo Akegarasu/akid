@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"os"
 	"path/filepath"
 	"testing"
 	"time"
@@ -33,6 +34,28 @@ func TestStartCommandUsesCobraForFlagsAndChildArguments(t *testing.T) {
 	}
 	if len(environment) != 1 || environment[0] != "MODE=prod" {
 		t.Fatalf("unexpected environment flags: %#v", environment)
+	}
+}
+
+func TestApplyCheckDoesNotConnectToDaemon(t *testing.T) {
+	dir := t.TempDir()
+	t.Setenv("XDG_STATE_HOME", filepath.Join(dir, "state"))
+	t.Setenv("XDG_RUNTIME_DIR", filepath.Join(dir, "missing-runtime"))
+	path := filepath.Join(dir, "akid.toml")
+	if err := os.WriteFile(path, []byte("[[process]]\nname='api'\ncommand='true'\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	cmd := newRootCommand(newApplication(&out, &out))
+	cmd.SetArgs([]string{"apply", "--check", path})
+	if err := cmd.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if out.String() != "valid configuration: 1 processes\n" {
+		t.Fatalf("output: %s", &out)
+	}
+	if _, err := os.Stat(filepath.Join(dir, "state")); !os.IsNotExist(err) {
+		t.Fatalf("validation created state: %v", err)
 	}
 }
 

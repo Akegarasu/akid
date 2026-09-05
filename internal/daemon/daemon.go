@@ -55,11 +55,6 @@ func Run(ctx context.Context, p paths.Paths) error {
 		return err
 	}
 	defer exec.Close()
-	mgr, err := manager.New(&storage.FileStore{Path: p.StateFile, Logger: logger}, exec, logs, logger)
-	if err != nil {
-		return err
-	}
-
 	// The exclusive instance lock is held before stale socket cleanup, so one
 	// daemon cannot unlink another live daemon's socket.
 	if err := os.Remove(p.Socket); err != nil && !errors.Is(err, os.ErrNotExist) {
@@ -69,11 +64,18 @@ func Run(ctx context.Context, p paths.Paths) error {
 	if err != nil {
 		return err
 	}
+	defer listener.Close()
 	if err := os.Chmod(p.Socket, 0o600); err != nil {
 		listener.Close()
 		return err
 	}
 	defer os.Remove(p.Socket)
+	// Bind the endpoint before restoring processes. A bind/permission failure
+	// must not leave restored children running without a reachable manager.
+	mgr, err := manager.New(&storage.FileStore{Path: p.StateFile, Logger: logger}, exec, logs, logger)
+	if err != nil {
+		return err
+	}
 
 	shutdown := make(chan struct{})
 	var shutdownOnce sync.Once

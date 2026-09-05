@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync/atomic"
 
@@ -122,7 +123,7 @@ func (c *Client) SubscribeEvents(ctx context.Context) (<-chan model.Event, error
 		defer stopContextWatch()
 		for scanner.Scan() {
 			var envelope EventEnvelope
-			if json.Unmarshal(scanner.Bytes(), &envelope) != nil {
+			if json.Unmarshal(scanner.Bytes(), &envelope) != nil || envelope.Protocol != Version {
 				return
 			}
 			if envelope.Event == "event.lagged" {
@@ -177,7 +178,7 @@ func (c *Client) SubscribeLogs(ctx context.Context, params LogSubscribeParams) (
 		defer stopContextWatch()
 		for scanner.Scan() {
 			var envelope EventEnvelope
-			if json.Unmarshal(scanner.Bytes(), &envelope) != nil {
+			if json.Unmarshal(scanner.Bytes(), &envelope) != nil || envelope.Protocol != Version {
 				return
 			}
 			if envelope.Event == "event.lagged" {
@@ -278,6 +279,9 @@ func WriteMessage(conn net.Conn, value any) error {
 		n, err := conn.Write(data)
 		if err != nil {
 			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
 		}
 		data = data[n:]
 	}

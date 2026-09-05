@@ -270,3 +270,68 @@ func TestRemoveChecksOwnerAndDetachesOldSubscriptions(t *testing.T) {
 		t.Fatalf("new logs changed: %q %v", data, err)
 	}
 }
+
+func TestReadAndSubscribeRejectPreviousOwner(t *testing.T) {
+	s, err := NewService(t.TempDir(), 1<<20, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.Register("api", "old"); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Remove("api", "old", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Register("api", "new"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.Read(LogReadRequest{Name: "api", Owner: "old", Stream: model.LogStdout}); !os.IsNotExist(err) {
+		t.Fatalf("old read: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if _, err := s.Subscribe(ctx, "api", model.LogStdout, 0, 0, "old"); !os.IsNotExist(err) {
+		t.Fatalf("old subscription: %v", err)
+	}
+	if _, err := s.Read(LogReadRequest{Name: "api", Owner: "new", Stream: model.LogStdout}); err != nil {
+		t.Fatalf("new read: %v", err)
+	}
+}
+
+func TestSubscriptionReportsGapForCursorBeyondEOF(t *testing.T) {
+	s, err := NewService(t.TempDir(), 1<<20, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.Register("api"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(s.Path("api", model.LogStdout), []byte("current\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	gen := s.Generation("api", model.LogStdout)
+	events, err := s.Subscribe(ctx, "api", model.LogStdout, 500, gen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case event := <-events:
+		if !event.Gap || event.Chunk.Generation != gen {
+			t.Fatalf("missing gap: %+v", event)
+		}
+	case <-ctx.Done():
+		t.Fatal("no gap")
+	}
+	select {
+	case event := <-events:
+		if string(event.Chunk.Data) != "current\n" || event.Chunk.StartOffset != 0 {
+			t.Fatalf("wrong recovery: %+v", event)
+		}
+	case <-ctx.Done():
+		t.Fatal("no replay after gap")
+	}
+}

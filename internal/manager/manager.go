@@ -170,10 +170,11 @@ func New(store storage.Store, exec executor.Executor, logs LogRegistry, logger *
 			status = model.StatusExited
 		}
 		r := &record{
-			config:  cfg,
-			desired: persisted.Desired,
-			runtime: model.RuntimeState{Status: status},
-			hint:    cloneHint(persisted.Hint),
+			config:       cfg,
+			desired:      persisted.Desired,
+			runtime:      model.RuntimeState{Status: status},
+			hint:         cloneHint(persisted.Hint),
+			restartAfter: persisted.RestartPending && persisted.Desired == model.DesiredRunning,
 		}
 		m.records[cfg.ID] = r
 		m.names[cfg.Name] = cfg.ID
@@ -252,6 +253,17 @@ func (m *Manager) Subscribe(ctx context.Context) (<-chan model.Event, error) {
 	}
 	id, err := await[uint64](ctx, reply)
 	if err != nil {
+		// Cancellation may win after the subscription was queued. Consume its
+		// eventual registration and remove it even though the caller has left.
+		go func() {
+			select {
+			case result := <-reply:
+				if id, ok := result.value.(uint64); ok {
+					m.post(unsubscribeEvent{id: id})
+				}
+			case <-m.done:
+			}
+		}()
 		return nil, err
 	}
 	go func() {
@@ -321,6 +333,8 @@ func (m *Manager) loop() {
 			e.reply <- opResult{err: m.restore()}
 		case createCmd:
 			m.handleCreate(e)
+		case applyCmd:
+			m.handleApply(e)
 		case actionCmd:
 			m.handleAction(e)
 		case deleteCmd:
@@ -379,7 +393,7 @@ func (m *Manager) restore() error {
 				r.runtime.StartedAt = startedAt
 				r.startedMono = startedAt
 				m.watch(r.config.ID, proc)
-				if r.desired == model.DesiredStopped {
+				if r.desired == model.DesiredStopped || r.restartAfter {
 					m.beginStop(r)
 				} else {
 					m.emit("process.started", r)
@@ -580,7 +594,9 @@ func (m *Manager) handleStopTimeout(event stopTimeoutEvent) {
 
 func (m *Manager) spawn(r *record, automatic bool) error {
 	m.cancelBackoff(r)
+	r.restartAfter = false
 	r.runtime.Status = model.StatusStarting
+	r.runtime.ExitCode = nil
 	r.runtime.NextRetryAt = time.Time{}
 	m.emit("process.updated", r)
 	stdout, stderr := m.logs.Paths(r.config.Name)
@@ -897,6 +913,8 @@ func (m *Manager) rejectPending() {
 				e.reply <- opResult{err: err}
 			case createCmd:
 				e.reply <- opResult{err: err}
+			case applyCmd:
+				e.reply <- opResult{err: err}
 			case actionCmd:
 				e.reply <- opResult{err: err}
 			case deleteCmd:
@@ -965,9 +983,10 @@ func (m *Manager) persist() error {
 	state := &model.PersistedState{Version: storage.StateVersion, Processes: make([]model.PersistedProcess, 0, len(m.records))}
 	for _, r := range m.records {
 		state.Processes = append(state.Processes, model.PersistedProcess{
-			ProcessConfig: cloneConfig(r.config),
-			Desired:       r.desired,
-			Hint:          cloneHint(r.hint),
+			ProcessConfig:  cloneConfig(r.config),
+			Desired:        r.desired,
+			Hint:           cloneHint(r.hint),
+			RestartPending: r.restartAfter,
 		})
 	}
 	sort.Slice(state.Processes, func(i, j int) bool { return state.Processes[i].Name < state.Processes[j].Name })

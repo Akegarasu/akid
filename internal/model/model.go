@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"strings"
 	"time"
 )
 
@@ -74,6 +75,19 @@ func (c *ProcessConfig) NormalizeAndValidate() error {
 	if c.Command == "" {
 		return errors.New("command is required")
 	}
+	if strings.ContainsRune(c.Command, 0) || strings.ContainsRune(c.Cwd, 0) {
+		return errors.New("command and cwd cannot contain NUL")
+	}
+	for _, arg := range c.Args {
+		if strings.ContainsRune(arg, 0) {
+			return errors.New("arguments cannot contain NUL")
+		}
+	}
+	for name, value := range c.Env {
+		if name == "" || strings.ContainsAny(name, "=\x00") || strings.ContainsRune(value, 0) {
+			return errors.New("environment names must be nonempty and contain neither '=' nor NUL; values cannot contain NUL")
+		}
+	}
 	if c.Restart == "" {
 		c.Restart = RestartAlways
 	}
@@ -109,8 +123,9 @@ type RuntimeHint struct {
 
 type PersistedProcess struct {
 	ProcessConfig
-	Desired DesiredState `json:"desired"`
-	Hint    *RuntimeHint `json:"hint,omitempty"`
+	Desired        DesiredState `json:"desired"`
+	Hint           *RuntimeHint `json:"hint,omitempty"`
+	RestartPending bool         `json:"restart_pending,omitempty"`
 }
 
 type PersistedState struct {

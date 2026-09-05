@@ -157,7 +157,8 @@ func (m Model) handleLogKey(key string) (tea.Model, tea.Cmd) {
 		m.logs.Buffer.Horizontal = 0
 	case "end":
 		if len(m.logs.Buffer.Lines) > 0 {
-			m.logs.Buffer.Horizontal = max(0, runeCount(m.logs.Buffer.Lines[m.logs.Buffer.CursorLine].Text)-max(1, m.width))
+			text := m.logs.Buffer.Lines[m.logs.Buffer.CursorLine].Text
+			m.logs.Buffer.Horizontal = max(0, textCellColumn(text, runeCount(text))-max(1, m.width))
 		}
 	case "left", "h":
 		if m.logs.Buffer.SelectionMode() == selectionCharacter {

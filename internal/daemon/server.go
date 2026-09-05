@@ -150,9 +150,6 @@ func (s *Server) dispatch(ctx context.Context, req protocol.Request) (any, bool,
 			return nil, false, err
 		}
 		value, err := s.manager.Delete(ctx, params.ID, params.Purge)
-		if err == nil && value.Purge {
-			err = s.logs.Purge(value.Name)
-		}
 		return value, false, err
 	case "log.read":
 		var params struct {
@@ -160,6 +157,7 @@ func (s *Server) dispatch(ctx context.Context, req protocol.Request) (any, bool,
 			Stream model.LogStream `json:"stream"`
 			Offset int64           `json:"offset"`
 			Limit  int             `json:"limit"`
+			Align  bool            `json:"align"`
 		}
 		if err := decodeParams(req.Params, &params); err != nil {
 			return nil, false, err
@@ -168,7 +166,7 @@ func (s *Server) dispatch(ctx context.Context, req protocol.Request) (any, bool,
 		if err != nil {
 			return nil, false, err
 		}
-		chunk, err := s.logs.Read(logging.LogReadRequest{Name: info.Config.Name, Stream: params.Stream, Offset: params.Offset, Limit: params.Limit})
+		chunk, err := s.logs.Read(logging.LogReadRequest{Name: info.Config.Name, Stream: params.Stream, Offset: params.Offset, Limit: params.Limit, Align: params.Align})
 		return chunk, false, err
 	default:
 		return nil, false, &manager.Error{Code: "METHOD_NOT_FOUND", Message: fmt.Sprintf("method %q not found", req.Method)}
@@ -191,7 +189,9 @@ func (s *Server) serveEventSubscription(ctx context.Context, conn net.Conn, writ
 	}
 	for event := range events {
 		envelope := protocol.EventEnvelope{Protocol: protocol.Version, Event: event.Name}
-		if event.Name != "event.lagged" {
+		if event.Snapshot != nil {
+			envelope.Data, _ = json.Marshal(event.Snapshot)
+		} else if event.Name != "event.lagged" {
 			envelope.Data, _ = json.Marshal(event.Data)
 		}
 		writeMu.Lock()
@@ -229,6 +229,9 @@ func (s *Server) serveLogSubscription(ctx context.Context, conn net.Conn, writeM
 	}
 	for event := range events {
 		name := "log.append"
+		if event.Gap {
+			name = "log.gap"
+		}
 		if event.Lagged {
 			name = "event.lagged"
 		}

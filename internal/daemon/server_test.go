@@ -102,6 +102,50 @@ func TestServerDispatchOverSocket(t *testing.T) {
 	if missing.Error == nil || missing.Error.Code != manager.CodeNotFound {
 		t.Fatalf("error code was not preserved: %#v", missing.Error)
 	}
+
+	sub, err := net.Dial("tcp", listener.Addr().String())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sub.Close()
+	if err := sub.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
+		t.Fatal(err)
+	}
+	subScanner := protocol.NewScanner(sub)
+	ack := roundTrip(t, sub, subScanner, 5, "event.subscribe", nil)
+	if ack.Error != nil {
+		t.Fatalf("subscribe failed: %#v", ack.Error)
+	}
+	readEvent := func() protocol.EventEnvelope {
+		if !subScanner.Scan() {
+			t.Fatalf("missing event: %v", subScanner.Err())
+		}
+		var event protocol.EventEnvelope
+		if err := json.Unmarshal(subScanner.Bytes(), &event); err != nil {
+			t.Fatal(err)
+		}
+		return event
+	}
+	initial := readEvent()
+	var snapshot model.ProcessSnapshot
+	if err := json.Unmarshal(initial.Data, &snapshot); err != nil {
+		t.Fatal(err)
+	}
+	if initial.Event != "process.snapshot" || initial.Protocol != protocol.Version || len(snapshot.Processes) != 1 || snapshot.Epoch == "" {
+		t.Fatalf("invalid initial snapshot: %#v %#v", initial, snapshot)
+	}
+	deleted := roundTrip(t, conn, scanner, 6, "process.delete", map[string]any{"id": processes[0].Config.ID})
+	if deleted.Error != nil {
+		t.Fatalf("delete failed: %#v", deleted.Error)
+	}
+	event := readEvent()
+	var removed model.ProcessInfo
+	if err := json.Unmarshal(event.Data, &removed); err != nil {
+		t.Fatal(err)
+	}
+	if event.Event != "process.deleted" || removed.Config.ID != processes[0].Config.ID || removed.Epoch != snapshot.Epoch || removed.Revision <= snapshot.Revision {
+		t.Fatalf("invalid deletion event: %#v %#v", event, removed)
+	}
 }
 
 func roundTrip(t *testing.T, conn net.Conn, scanner interface {

@@ -61,7 +61,9 @@ func (a *application) runLogs(parent context.Context, id string, options logsOpt
 		return err
 	}
 	if options.lines > 0 {
-		_, _ = a.out.Write(lastLines(chunk.Data, options.lines))
+		if _, err := a.out.Write(lastLines(chunk.Data, options.lines)); err != nil {
+			return err
+		}
 	}
 	if !options.follow {
 		return nil
@@ -92,6 +94,11 @@ func (a *application) runLogs(parent context.Context, id string, options logsOpt
 					resume = true
 					continue
 				}
+				if event.Gap {
+					fmt.Fprintln(a.errOut, "--- log continuity lost; reading current active file ---")
+					cursor, generation = 0, event.Chunk.Generation
+					continue
+				}
 				if _, err := a.out.Write(event.Chunk.Data); err != nil {
 					return err
 				}
@@ -106,14 +113,20 @@ func lastLines(data []byte, count int) []byte {
 	if count <= 0 || len(data) == 0 {
 		return nil
 	}
-	trimmed := bytes.TrimSuffix(data, []byte("\n"))
-	parts := bytes.Split(trimmed, []byte("\n"))
-	if len(parts) > count {
-		parts = parts[len(parts)-count:]
+	end := len(data)
+	if data[end-1] == '\n' {
+		end--
 	}
-	result := bytes.Join(parts, []byte("\n"))
-	if len(result) > 0 {
-		result = append(result, '\n')
+	for count > 0 && end > 0 {
+		previous := bytes.LastIndexByte(data[:end], '\n')
+		count--
+		if previous < 0 {
+			return data
+		}
+		if count == 0 {
+			return data[previous+1:]
+		}
+		end = previous
 	}
-	return result
+	return data
 }

@@ -14,15 +14,18 @@ import (
 )
 
 type processList struct {
-	all            []model.ProcessInfo
-	visible        []model.ProcessInfo
-	selected       int
-	viewTop        int
-	query          string
-	searching      bool
-	searchInput    textinput.Model
-	searchOriginal string
-	metrics        map[string]model.ProcessMetrics
+	epoch            string
+	snapshotRevision uint64
+	versions         map[string]uint64
+	all              []model.ProcessInfo
+	visible          []model.ProcessInfo
+	selected         int
+	viewTop          int
+	query            string
+	searching        bool
+	searchInput      textinput.Model
+	searchOriginal   string
+	metrics          map[string]model.ProcessMetrics
 }
 
 func newProcessList() processList {
@@ -30,7 +33,57 @@ func newProcessList() processList {
 	input.Prompt = "/ "
 	input.CharLimit = 256
 	input.SetWidth(40)
-	return processList{searchInput: input, metrics: make(map[string]model.ProcessMetrics)}
+	return processList{searchInput: input, metrics: make(map[string]model.ProcessMetrics), versions: make(map[string]uint64)}
+}
+
+func (l *processList) ApplySnapshot(snapshot model.ProcessSnapshot) {
+	items := append([]model.ProcessInfo(nil), snapshot.Processes...)
+	if snapshot.Epoch == l.epoch {
+		if snapshot.Revision < l.snapshotRevision {
+			return
+		}
+		kept := items[:0]
+		for _, info := range items {
+			if l.versions[info.Config.ID] <= snapshot.Revision {
+				kept = append(kept, info)
+			}
+		}
+		items = kept
+		for _, info := range l.all {
+			if info.Revision > snapshot.Revision {
+				items = append(items, info)
+			}
+		}
+	} else {
+		clear(l.versions)
+	}
+	l.epoch, l.snapshotRevision = snapshot.Epoch, snapshot.Revision
+	for id, revision := range l.versions {
+		if revision <= snapshot.Revision {
+			delete(l.versions, id)
+		}
+	}
+	l.Set(items)
+}
+
+func (l *processList) ApplyChange(info model.ProcessInfo, deleted bool) bool {
+	if info.Epoch != l.epoch || info.Revision <= max(l.snapshotRevision, l.versions[info.Config.ID]) {
+		return false
+	}
+	l.versions[info.Config.ID] = info.Revision
+	if !deleted {
+		l.Upsert(info)
+		return true
+	}
+	items := make([]model.ProcessInfo, 0, len(l.all))
+	for _, old := range l.all {
+		if old.Config.ID != info.Config.ID {
+			items = append(items, old)
+		}
+	}
+	l.Set(items)
+	delete(l.metrics, info.Config.ID)
+	return true
 }
 
 func (l *processList) Set(processes []model.ProcessInfo) {

@@ -3,6 +3,8 @@ package logging
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -25,14 +27,17 @@ type LogReadRequest struct {
 	Stream model.LogStream
 	Offset int64
 	Limit  int
+	Align  bool
 }
 
 type LogChunk struct {
-	StartOffset int64  `json:"start_offset"`
-	EndOffset   int64  `json:"end_offset"`
-	Generation  uint64 `json:"generation"`
-	Data        []byte `json:"data"`
-	EOF         bool   `json:"eof"`
+	StartOffset  int64  `json:"start_offset"`
+	EndOffset    int64  `json:"end_offset"`
+	Generation   uint64 `json:"generation"`
+	Data         []byte `json:"data"`
+	EOF          bool   `json:"eof"`
+	PartialStart bool   `json:"partial_start,omitempty"`
+	PartialEnd   bool   `json:"partial_end,omitempty"`
 }
 
 type LogEvent struct {
@@ -40,26 +45,30 @@ type LogEvent struct {
 	Stream model.LogStream `json:"stream,omitempty"`
 	Chunk  LogChunk        `json:"chunk,omitempty"`
 	Lagged bool            `json:"lagged,omitempty"`
+	Gap    bool            `json:"gap,omitempty"`
 }
 
 type fileState struct {
 	mu         sync.Mutex
 	generation uint64
+	removed    bool
 }
 
 type processLogs struct {
+	owner  string
 	stdout fileState
 	stderr fileState
 }
 
 type Service struct {
-	dir      string
-	maxSize  int64
-	keep     int
-	mu       sync.RWMutex
-	entries  map[string]*processLogs
-	closed   chan struct{}
-	closeOne sync.Once
+	dir          string
+	maxSize      int64
+	keep         int
+	mu           sync.RWMutex
+	entries      map[string]*processLogs
+	closed       chan struct{}
+	closeOne     sync.Once
+	rotationDone chan struct{}
 }
 
 func NewService(dir string, maxSize int64, keep int) (*Service, error) {
@@ -74,22 +83,38 @@ func NewService(dir string, maxSize int64, keep int) (*Service, error) {
 	}
 	cleanupRotationTemps(dir)
 	s := &Service{
-		dir:     dir,
-		maxSize: maxSize,
-		keep:    keep,
-		entries: make(map[string]*processLogs),
-		closed:  make(chan struct{}),
+		dir:          dir,
+		maxSize:      maxSize,
+		keep:         keep,
+		entries:      make(map[string]*processLogs),
+		closed:       make(chan struct{}),
+		rotationDone: make(chan struct{}),
 	}
 	go s.rotationLoop()
 	return s, nil
 }
 
-func (s *Service) Register(name string) error {
+func (s *Service) Register(name string, owners ...string) error {
 	s.mu.Lock()
-	if _, ok := s.entries[name]; !ok {
-		s.entries[name] = &processLogs{}
+	defer s.mu.Unlock()
+	owner := ""
+	if len(owners) > 0 {
+		owner = owners[0]
 	}
-	s.mu.Unlock()
+	if entry := s.entries[name]; entry != nil {
+		if entry.owner != owner {
+			return errors.New("log name belongs to another process")
+		}
+		return nil
+	}
+	outGeneration, err := newGeneration()
+	if err != nil {
+		return err
+	}
+	errGeneration, err := newGeneration()
+	if err != nil {
+		return err
+	}
 	for _, stream := range []model.LogStream{model.LogStdout, model.LogStderr} {
 		f, err := os.OpenFile(s.Path(name, stream), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0o600)
 		if err != nil {
@@ -103,7 +128,17 @@ func (s *Service) Register(name string) error {
 			return err
 		}
 	}
+	s.entries[name] = &processLogs{owner: owner, stdout: fileState{generation: outGeneration}, stderr: fileState{generation: errGeneration}}
 	return nil
+}
+
+func newGeneration() (uint64, error) {
+	var data [8]byte
+	if _, err := rand.Read(data[:]); err != nil {
+		return 0, err
+	}
+	// Stay exactly representable by JSON consumers using IEEE-754 numbers.
+	return (binary.BigEndian.Uint64(data[:]) >> 12) + 1, nil
 }
 
 func (s *Service) Path(name string, stream model.LogStream) string {
@@ -139,11 +174,18 @@ func (s *Service) Read(req LogReadRequest) (LogChunk, error) {
 		req.Limit = MaxReadSize
 	}
 	state := s.file(req.Name, req.Stream)
+	return s.read(req, state)
+}
+
+func (s *Service) read(req LogReadRequest, state *fileState) (LogChunk, error) {
 	if state == nil {
 		return LogChunk{}, os.ErrNotExist
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
+	if state.removed {
+		return LogChunk{}, os.ErrNotExist
+	}
 
 	f, err := os.Open(s.Path(req.Name, req.Stream))
 	if err != nil {
@@ -165,9 +207,12 @@ func (s *Service) Read(req LogReadRequest) (LogChunk, error) {
 	if offset > size {
 		offset = size
 	}
-	start, err := alignStart(f, offset, size)
-	if err != nil {
-		return LogChunk{}, err
+	start := offset
+	if req.Align || req.Offset < 0 {
+		start, err = alignStart(f, offset, min(size, offset+int64(req.Limit)))
+		if err != nil {
+			return LogChunk{}, err
+		}
 	}
 	if start >= size {
 		return LogChunk{StartOffset: start, EndOffset: start, Generation: state.generation, EOF: true}, nil
@@ -180,30 +225,32 @@ func (s *Service) Read(req LogReadRequest) (LogChunk, error) {
 	}
 	buf = buf[:n]
 	end := start + int64(n)
-	reachedEOF := end >= size
-	if last := bytes.LastIndexByte(buf, '\n'); last >= 0 && last+1 < len(buf) {
+	if last := bytes.LastIndexByte(buf, '\n'); last >= 0 && last+1 < len(buf) && end < size {
 		buf = buf[:last+1]
 		end = start + int64(last+1)
-	} else if last < 0 && reachedEOF {
-		// Keep an unterminated final line buffered until it becomes complete.
-		// This is important for follow mode: advancing into a partial line
-		// would make the next aligned read skip its continuation.
-		buf = buf[:0]
-		end = start
 	}
-	// If a single complete line is longer than Limit, return a partial chunk
-	// so callers still make progress. Normal lines remain line-aligned.
+	partialStart := false
+	if start > 0 {
+		var previous [1]byte
+		if _, err := f.ReadAt(previous[:], start-1); err != nil {
+			return LogChunk{}, err
+		}
+		partialStart = previous[0] != '\n'
+	}
 	return LogChunk{
-		StartOffset: start,
-		EndOffset:   end,
-		Generation:  state.generation,
-		Data:        buf,
-		EOF:         end >= size,
+		StartOffset:  start,
+		EndOffset:    end,
+		Generation:   state.generation,
+		Data:         buf,
+		EOF:          end >= size,
+		PartialStart: partialStart,
+		PartialEnd:   len(buf) > 0 && buf[len(buf)-1] != '\n',
 	}, nil
 }
 
 func (s *Service) Subscribe(ctx context.Context, name string, stream model.LogStream, offset int64, generation uint64) (<-chan LogEvent, error) {
-	if s.file(name, stream) == nil {
+	state := s.file(name, stream)
+	if state == nil {
 		return nil, os.ErrNotExist
 	}
 	out := make(chan LogEvent, 1024)
@@ -221,13 +268,25 @@ func (s *Service) Subscribe(ctx context.Context, name string, stream model.LogSt
 				return
 			case <-ticker.C:
 				for {
-					chunk, err := s.Read(LogReadRequest{Name: name, Stream: stream, Offset: cursor, Limit: 64 << 10})
+					select {
+					case <-ctx.Done():
+						return
+					case <-s.closed:
+						return
+					default:
+					}
+					chunk, err := s.read(LogReadRequest{Name: name, Stream: stream, Offset: cursor, Limit: 64 << 10}, state)
 					if err != nil {
 						return
 					}
 					if chunk.Generation != currentGeneration {
 						currentGeneration = chunk.Generation
 						cursor = 0
+						// Archives are not part of this stream. Explicitly invalidate
+						// the cursor even when the new active file is still empty.
+						if !sendLogEvent(out, LogEvent{Name: name, Stream: stream, Gap: true, Chunk: LogChunk{Generation: currentGeneration}}) {
+							return
+						}
 						continue
 					}
 					if len(chunk.Data) == 0 {
@@ -235,14 +294,7 @@ func (s *Service) Subscribe(ctx context.Context, name string, stream model.LogSt
 					}
 					cursor = chunk.EndOffset
 					event := LogEvent{Name: name, Stream: stream, Chunk: chunk}
-					select {
-					case out <- event:
-					default:
-						select {
-						case <-out:
-						default:
-						}
-						out <- LogEvent{Lagged: true}
+					if !sendLogEvent(out, event) {
 						return
 					}
 					if chunk.EOF {
@@ -255,32 +307,64 @@ func (s *Service) Subscribe(ctx context.Context, name string, stream model.LogSt
 	return out, nil
 }
 
-func (s *Service) Purge(name string) error {
+func sendLogEvent(out chan LogEvent, event LogEvent) bool {
+	select {
+	case out <- event:
+		return true
+	default:
+		select {
+		case <-out:
+		default:
+		}
+		out <- LogEvent{Lagged: true}
+		return false
+	}
+}
+
+func (s *Service) Remove(name, owner string, purge bool) error {
 	s.mu.Lock()
-	delete(s.entries, name)
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	entry := s.entries[name]
+	if entry == nil {
+		return nil
+	}
+	if entry.owner != owner {
+		return errors.New("log owner mismatch")
+	}
+	entry.stdout.mu.Lock()
+	defer entry.stdout.mu.Unlock()
+	entry.stderr.mu.Lock()
+	defer entry.stderr.mu.Unlock()
 	var first error
-	for _, stream := range []model.LogStream{model.LogStdout, model.LogStderr} {
-		path := s.Path(name, stream)
-		for i := 0; i <= s.keep; i++ {
-			candidate := path
-			if i > 0 {
-				candidate = fmt.Sprintf("%s.%d", path, i)
-			}
-			if err := os.Remove(candidate); err != nil && !errors.Is(err, os.ErrNotExist) && first == nil {
-				first = err
+	if purge {
+		for _, stream := range []model.LogStream{model.LogStdout, model.LogStderr} {
+			path := s.Path(name, stream)
+			for i := 0; i <= s.keep; i++ {
+				candidate := path
+				if i > 0 {
+					candidate = fmt.Sprintf("%s.%d", path, i)
+				}
+				if err := os.Remove(candidate); err != nil && !errors.Is(err, os.ErrNotExist) && first == nil {
+					first = err
+				}
 			}
 		}
+	}
+	if first == nil {
+		entry.stdout.removed, entry.stderr.removed = true, true
+		delete(s.entries, name)
 	}
 	return first
 }
 
 func (s *Service) Close() error {
 	s.closeOne.Do(func() { close(s.closed) })
+	<-s.rotationDone
 	return nil
 }
 
 func (s *Service) rotationLoop() {
+	defer close(s.rotationDone)
 	ticker := time.NewTicker(time.Second)
 	defer ticker.Stop()
 	for {
@@ -314,6 +398,9 @@ func (s *Service) rotate(name string, stream model.LogStream) error {
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
+	if state.removed {
+		return nil
+	}
 	path := s.Path(name, stream)
 	info, err := os.Stat(path)
 	if err != nil {
@@ -343,10 +430,14 @@ func (s *Service) rotate(name string, stream model.LogStream) error {
 			return err
 		}
 	}
+	generation, err := newGeneration()
+	if err != nil {
+		return err
+	}
 	if err := os.Truncate(path, 0); err != nil {
 		return err
 	}
-	state.generation++
+	state.generation = generation
 	return nil
 }
 
@@ -380,7 +471,7 @@ func alignStart(f *os.File, offset, size int64) (int64, error) {
 	buf := make([]byte, 4096)
 	cursor := offset
 	for cursor < size {
-		n, err := f.ReadAt(buf, cursor)
+		n, err := f.ReadAt(buf[:min(int64(len(buf)), size-cursor)], cursor)
 		if err != nil && !errors.Is(err, io.EOF) {
 			return 0, err
 		}
@@ -392,7 +483,8 @@ func alignStart(f *os.File, offset, size int64) (int64, error) {
 			break
 		}
 	}
-	return size, nil
+	// A long or unterminated line must still be readable from this offset.
+	return offset, nil
 }
 
 func cleanupRotationTemps(dir string) {

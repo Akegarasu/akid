@@ -21,11 +21,6 @@ type Client interface {
 	SubscribeLogs(ctx context.Context, params protocol.LogSubscribeParams) (<-chan akidlog.LogEvent, error)
 }
 
-type processesLoadedMsg struct {
-	processes []model.ProcessInfo
-	err       error
-}
-
 type metricsLoadedMsg struct {
 	metrics []model.ProcessMetrics
 	err     error
@@ -94,16 +89,6 @@ type selectionWrittenMsg struct {
 	err  error
 }
 
-func loadProcessesCmd(ctx context.Context, client Client) tea.Cmd {
-	return func() tea.Msg {
-		callCtx, cancel := context.WithTimeout(ctx, callTimeout)
-		defer cancel()
-		var processes []model.ProcessInfo
-		err := client.Call(callCtx, "process.list", nil, &processes)
-		return processesLoadedMsg{processes: processes, err: err}
-	}
-}
-
 func loadMetricsCmd(ctx context.Context, client Client) tea.Cmd {
 	return func() tea.Msg {
 		callCtx, cancel := context.WithTimeout(ctx, callTimeout)
@@ -145,6 +130,7 @@ func readLogCmd(ctx context.Context, client Client, token uint64, id string, str
 		var chunk akidlog.LogChunk
 		err := client.Call(callCtx, "log.read", map[string]any{
 			"id": id, "stream": stream, "offset": offset, "limit": limit,
+			"align": kind == logReadTail,
 		}, &chunk)
 		return logReadMsg{token: token, kind: kind, chunk: chunk, err: err}
 	}

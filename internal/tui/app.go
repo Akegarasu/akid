@@ -83,7 +83,7 @@ func Run(ctx context.Context, client Client, output io.Writer, options Options) 
 }
 
 func (m Model) Init() tea.Cmd {
-	return tea.Batch(loadProcessesCmd(m.ctx, m.client), loadMetricsCmd(m.ctx, m.client), subscribeEventsCmd(m.ctx, m.client), tickCmd())
+	return tea.Batch(loadMetricsCmd(m.ctx, m.client), subscribeEventsCmd(m.ctx, m.client), tickCmd())
 }
 
 func (m Model) View() tea.View {

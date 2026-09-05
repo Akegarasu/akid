@@ -24,7 +24,7 @@ func (m Model) handleMouse(message tea.MouseMsg) (tea.Model, tea.Cmd) {
 				index := m.logs.Buffer.ViewTop + mouse.Y - 1
 				if index >= 0 && index < len(m.logs.Buffer.Lines) {
 					m.logs.Buffer.CursorLine = index
-					m.logs.Buffer.CursorCol = clamp(m.logs.Buffer.Horizontal+mouse.X, 0, runeCount(m.logs.Buffer.Lines[index].Text))
+					m.logs.Buffer.CursorCol = textRuneAtCell(m.logs.Buffer.Lines[index].Text, m.logs.Buffer.Horizontal+mouse.X)
 					m.logs.Buffer.Follow = false
 				}
 			}

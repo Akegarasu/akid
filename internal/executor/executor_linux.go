@@ -3,7 +3,6 @@
 package executor
 
 import (
-	"bufio"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -21,20 +20,40 @@ import (
 
 type LinuxExecutor struct {
 	mu       sync.Mutex
-	watchers map[int]chan ExitResult
+	watchers map[int]*groupWatch
 	sigchld  chan os.Signal
 	closed   chan struct{}
+	finished chan struct{}
 	once     sync.Once
 }
+
+type groupWatch struct {
+	startTime   uint64
+	done        chan ExitResult
+	adopted     bool
+	members     map[int]uint64
+	stopTimeout time.Duration
+	cleanupAt   time.Time
+	emptySeen   bool
+}
+
+type processStat struct {
+	pid, parent, group int
+	startTime          uint64
+	state              string
+}
+
+func (s processStat) live() bool { return s.state != "Z" && s.state != "X" }
 
 func New() (Executor, error) {
 	if err := unix.Prctl(unix.PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0); err != nil {
 		return nil, fmt.Errorf("enable child subreaper: %w", err)
 	}
 	e := &LinuxExecutor{
-		watchers: make(map[int]chan ExitResult),
+		watchers: make(map[int]*groupWatch),
 		sigchld:  make(chan os.Signal, 1),
 		closed:   make(chan struct{}),
+		finished: make(chan struct{}),
 	}
 	notifySIGCHLD(e.sigchld)
 	go e.reapLoop()
@@ -71,49 +90,41 @@ func (e *LinuxExecutor) Start(cfg model.ProcessConfig, logs LogPaths) (*RunningP
 	}
 	pid := cmd.Process.Pid
 	done := make(chan ExitResult, 1)
-	e.watchers[pid] = done
-	e.mu.Unlock()
-
-	startTime, statErr := readStartTime(pid)
+	// The reaper is excluded here, so even an exited child still has an
+	// identity in /proc. Read zombie identities too, preserving its exit code.
+	stat, statErr := readProcessStat(pid)
 	if statErr != nil {
-		// Fork/exec has already succeeded, so returning without cleanup would
-		// leave a live process that the manager never learns about. Kill the
-		// newly-created group while its PID is still ours and let the central
-		// reaper consume its wait status through the registered watcher.
 		_ = syscall.Kill(-pid, syscall.SIGKILL)
 		_ = cmd.Process.Kill()
-		_ = cmd.Process.Release()
-		select {
-		case <-done:
-		case <-time.After(2 * time.Second):
-		}
+		e.mu.Unlock()
+		_ = cmd.Wait()
 		return nil, fmt.Errorf("read process identity: %w", statErr)
 	}
+	startTime := stat.startTime
+	e.watchers[pid] = &groupWatch{startTime: startTime, done: done, members: map[int]uint64{pid: startTime}, stopTimeout: cfg.StopTimeout()}
+	e.mu.Unlock()
 	_ = cmd.Process.Release() // wait4 is owned by reapLoop.
 	return &RunningProcess{PID: pid, StartTime: startTime, StartedAt: time.Now(), Done: done}, nil
 }
 
 func (e *LinuxExecutor) Adopt(pid int, startTime uint64) (*RunningProcess, error) {
-	if !e.Alive(pid, startTime) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	stat, err := readProcessStat(pid)
+	if err != nil || stat.startTime != startTime || stat.group != pid {
 		return nil, ErrProcessGone
 	}
+	if watch := e.watchers[pid]; watch != nil {
+		return nil, errors.New("process is already tracked")
+	}
 	done := make(chan ExitResult, 1)
-	go func() {
-		ticker := time.NewTicker(AdoptPollInterval)
-		defer ticker.Stop()
-		defer close(done)
-		for {
-			select {
-			case <-e.closed:
-				return
-			case <-ticker.C:
-				if !e.Alive(pid, startTime) {
-					done <- ExitResult{Code: -1, Known: false}
-					return
-				}
-			}
+	watch := &groupWatch{startTime: startTime, done: done, adopted: true, members: map[int]uint64{pid: startTime}, stopTimeout: model.DefaultStopTimeout}
+	for _, member := range processTable() {
+		if member.group == pid {
+			watch.members[member.pid] = member.startTime
 		}
-	}()
+	}
+	e.watchers[pid] = watch
 	return &RunningProcess{PID: pid, StartTime: startTime, StartedAt: processStartedAt(startTime), Done: done, Adopted: true}, nil
 }
 
@@ -121,23 +132,75 @@ func (e *LinuxExecutor) Alive(pid int, startTime uint64) bool {
 	if pid <= 0 || startTime == 0 {
 		return false
 	}
-	actual, err := readStartTime(pid)
-	return err == nil && actual == startTime
+	stat, err := readProcessStat(pid)
+	return err == nil && stat.startTime == startTime && stat.group == pid
 }
 
 func (e *LinuxExecutor) SignalGroup(pid int, startTime uint64, force bool) error {
-	if !e.Alive(pid, startTime) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	watch := e.watchers[pid]
+	if watch == nil || watch.startTime != startTime {
 		return ErrProcessGone
 	}
 	sig := syscall.SIGTERM
 	if force {
 		sig = syscall.SIGKILL
 	}
-	if err := syscall.Kill(-pid, sig); err != nil {
-		if errors.Is(err, syscall.ESRCH) {
-			return ErrProcessGone
+	return signalTrackedGroup(pid, watch, processTable(), sig)
+}
+
+func trackedMembers(pid int, watch *groupWatch, table map[int]processStat) []processStat {
+	// A matching leader (including our unreaped zombie) or previously seen
+	// member anchors ownership. A numeric PGID alone is never sufficient.
+	anchored := false
+	for memberPID, startTime := range watch.members {
+		if stat, ok := table[memberPID]; ok && stat.startTime == startTime && stat.group == pid {
+			anchored = true
+			break
 		}
-		return err
+	}
+	if !anchored {
+		return nil
+	}
+	var members []processStat
+	for _, stat := range table {
+		if stat.group == pid {
+			watch.members[stat.pid] = stat.startTime
+			if stat.live() {
+				members = append(members, stat)
+			}
+		}
+	}
+	return members
+}
+
+func signalTrackedGroup(pid int, watch *groupWatch, table map[int]processStat, sig syscall.Signal) error {
+	members := trackedMembers(pid, watch, table)
+	if len(members) == 0 {
+		return ErrProcessGone
+	}
+	if leader, err := readProcessStat(pid); err == nil && leader.startTime == watch.startTime && leader.group == pid {
+		return syscall.Kill(-pid, sig)
+	}
+	// An adopted leader may have been reaped by PID 1. Pin each known member
+	// with a pidfd before validating its identity to avoid signalling reused PIDs.
+	for _, member := range members {
+		fd, err := unix.PidfdOpen(member.pid, 0)
+		if errors.Is(err, syscall.ESRCH) {
+			continue
+		}
+		if err != nil {
+			return err
+		}
+		actual, statErr := readProcessStat(member.pid)
+		if statErr == nil && actual.startTime == member.startTime && actual.group == pid {
+			err = unix.PidfdSendSignal(fd, unix.Signal(sig), nil, 0)
+		}
+		_ = unix.Close(fd)
+		if err != nil && !errors.Is(err, syscall.ESRCH) {
+			return err
+		}
 	}
 	return nil
 }
@@ -146,40 +209,83 @@ func (e *LinuxExecutor) Close() error {
 	e.once.Do(func() {
 		stopSIGCHLD(e.sigchld)
 		close(e.closed)
+		<-e.finished
+		e.mu.Lock()
+		for pid, watch := range e.watchers {
+			close(watch.done)
+			delete(e.watchers, pid)
+		}
+		e.mu.Unlock()
 	})
 	return nil
 }
 
 func (e *LinuxExecutor) reapLoop() {
+	defer close(e.finished)
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-e.closed:
 			return
 		case <-e.sigchld:
-			for {
-				e.mu.Lock()
-				var status syscall.WaitStatus
-				pid, err := syscall.Wait4(-1, &status, syscall.WNOHANG, nil)
-				if pid > 0 {
-					if ch, ok := e.watchers[pid]; ok {
-						delete(e.watchers, pid)
-						result := exitResult(status)
-						select {
-						case ch <- result:
-						default:
-						}
-						close(ch)
-					}
-				}
-				e.mu.Unlock()
-				if pid <= 0 {
-					if err != nil && !errors.Is(err, syscall.ECHILD) && !errors.Is(err, syscall.EINTR) {
-						// A later SIGCHLD notification retries. There is no safe
-						// action for a transient wait4 failure here.
-					}
-					break
-				}
+		case <-ticker.C:
+		}
+		e.reap()
+	}
+}
+
+func (e *LinuxExecutor) reap() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	table := processTable()
+	if table == nil {
+		return
+	}
+	for pid, watch := range e.watchers {
+		leader, exists := table[pid]
+		members := trackedMembers(pid, watch, table)
+		if exists && leader.startTime == watch.startTime && leader.live() {
+			watch.emptySeen = false
+			continue
+		}
+		if len(members) > 0 {
+			watch.emptySeen = false
+			if watch.cleanupAt.IsZero() {
+				watch.cleanupAt = time.Now().Add(watch.stopTimeout)
+				_ = signalTrackedGroup(pid, watch, table, syscall.SIGTERM)
+			} else if !time.Now().Before(watch.cleanupAt) {
+				_ = signalTrackedGroup(pid, watch, table, syscall.SIGKILL)
 			}
+			continue
+		}
+		// Scan once more after observing the leader exit, since a descendant
+		// can be forked between /proc enumeration and reading the leader stat.
+		if !watch.emptySeen {
+			watch.emptySeen = true
+			continue
+		}
+		result := ExitResult{Code: -1}
+		if !watch.adopted {
+			// Keep the leader unreaped until cleanup completes; its PID cannot
+			// be reused while it anchors the process group's identity.
+			var status syscall.WaitStatus
+			waited, err := syscall.Wait4(pid, &status, syscall.WNOHANG, nil)
+			if err != nil || waited != pid {
+				continue
+			}
+			result = exitResult(status)
+		}
+		watch.done <- result
+		close(watch.done)
+		delete(e.watchers, pid)
+	}
+	// Reap exited descendants reparented to the subreaper, without consuming
+	// the managed leaders whose wait status belongs to their watcher.
+	for pid, stat := range table {
+		if stat.parent == os.Getpid() && !stat.live() && e.watchers[pid] == nil {
+			var status syscall.WaitStatus
+			_, _ = syscall.Wait4(pid, &status, syscall.WNOHANG, nil)
 		}
 	}
 }
@@ -194,30 +300,51 @@ func exitResult(status syscall.WaitStatus) ExitResult {
 	return ExitResult{Code: -1, Known: false}
 }
 
-func readStartTime(pid int) (uint64, error) {
-	f, err := os.Open(fmt.Sprintf("/proc/%d/stat", pid))
+func readProcessStat(pid int) (processStat, error) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
 	if err != nil {
-		return 0, err
+		return processStat{}, err
 	}
-	defer f.Close()
-	line, err := bufio.NewReaderSize(f, 4096).ReadString('\n')
-	if err != nil && len(line) == 0 {
-		return 0, err
-	}
+	return parseProcessStat(pid, string(data))
+}
+
+func parseProcessStat(pid int, line string) (processStat, error) {
 	endComm := strings.LastIndexByte(line, ')')
 	if endComm < 0 || endComm+2 >= len(line) {
-		return 0, errors.New("malformed /proc stat")
+		return processStat{}, errors.New("malformed /proc stat")
 	}
 	fields := strings.Fields(line[endComm+2:])
-	// fields[0] is stat field 3 (state); starttime is field 22. A zombie
-	// still has a /proc entry but is not a live process that can be adopted.
 	if len(fields) <= 19 {
-		return 0, errors.New("short /proc stat")
+		return processStat{}, errors.New("short /proc stat")
 	}
-	if fields[0] == "Z" || fields[0] == "X" {
-		return 0, os.ErrNotExist
+	parent, err := strconv.Atoi(fields[1])
+	if err != nil {
+		return processStat{}, err
 	}
-	return strconv.ParseUint(fields[19], 10, 64)
+	group, err := strconv.Atoi(fields[2])
+	if err != nil {
+		return processStat{}, err
+	}
+	startTime, err := strconv.ParseUint(fields[19], 10, 64)
+	return processStat{pid: pid, parent: parent, group: group, startTime: startTime, state: fields[0]}, err
+}
+
+func processTable() map[int]processStat {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return nil
+	}
+	table := make(map[int]processStat)
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil {
+			continue
+		}
+		if stat, err := readProcessStat(pid); err == nil {
+			table[pid] = stat
+		}
+	}
+	return table
 }
 
 var (

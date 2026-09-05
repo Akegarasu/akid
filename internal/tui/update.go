@@ -16,14 +16,6 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.detailTop = min(m.detailTop, m.detailMaxTop())
 		m.logs.Buffer.ensureVisible(m.logBodyHeight())
 		return m, nil
-	case processesLoadedMsg:
-		if msg.err != nil {
-			m.setStatus("Cannot load processes: "+msg.err.Error(), true)
-			return m, nil
-		}
-		m.processes.Set(msg.processes)
-		m.syncCurrentProcess()
-		return m, nil
 	case metricsLoadedMsg:
 		m.metricsPending = false
 		if msg.err != nil {
@@ -39,9 +31,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.setStatus("Status events disconnected: "+msg.err.Error(), true)
 			return m, reconnectEventsAfter()
 		}
-		// Reconcile after every (re)connect because events may have been
-		// missed while the subscription was down.
-		return m, tea.Batch(waitProcessEventCmd(msg.events), loadProcessesCmd(m.ctx, m.client))
+		return m, waitProcessEventCmd(msg.events)
 	case processEventMsg:
 		if !msg.open {
 			return m, reconnectEventsAfter()
@@ -49,11 +39,14 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		cmds := []tea.Cmd{waitProcessEventCmd(msg.events)}
 		if msg.event.Name == "event.lagged" {
 			m.setStatus("Status events lagged; refreshing", true)
-			cmds = append(cmds, loadProcessesCmd(m.ctx, m.client))
 			return m, tea.Batch(cmds...)
 		}
-		m.processes.Upsert(msg.event.Data)
-		m.updateCurrentProcess(msg.event.Data)
+		if msg.event.Snapshot != nil {
+			m.processes.ApplySnapshot(*msg.event.Snapshot)
+			m.syncCurrentProcess()
+		} else if m.processes.ApplyChange(msg.event.Data, msg.event.Name == "process.deleted") {
+			m.syncCurrentProcess()
+		}
 		return m, tea.Batch(cmds...)
 	case reconnectEventsMsg:
 		return m, subscribeEventsCmd(m.ctx, m.client)
@@ -62,8 +55,9 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.setStatus(msg.action+" failed: "+msg.err.Error(), true)
 			return m, nil
 		}
-		m.processes.Upsert(msg.info)
-		m.updateCurrentProcess(msg.info)
+		if m.processes.ApplyChange(msg.info, false) {
+			m.syncCurrentProcess()
+		}
 		m.setStatus(msg.action+" requested for "+msg.info.Config.Name, false)
 		return m, nil
 	case logReadMsg:
@@ -142,6 +136,8 @@ func (m *Model) syncCurrentProcess() {
 				return
 			}
 		}
+		m.view = viewProcesses
+		m.setStatus("Process was removed", false)
 	}
 	if m.view == viewLogs {
 		for _, info := range m.processes.all {
@@ -150,6 +146,9 @@ func (m *Model) syncCurrentProcess() {
 				return
 			}
 		}
+		m.closeLogSubscription()
+		m.view = viewProcesses
+		m.setStatus("Process was removed", false)
 	}
 }
 

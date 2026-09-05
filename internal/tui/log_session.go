@@ -66,7 +66,8 @@ func (m Model) handleLogRead(msg logReadMsg) (tea.Model, tea.Cmd) {
 	}
 	switch msg.kind {
 	case logReadTail:
-		m.logs.Buffer.Reset(msg.chunk, m.logs.Buffer.Follow)
+		m.logs.Buffer.reset(msg.chunk, m.logs.Buffer.Follow, false)
+		m.logs.Buffer.ensureVisible(m.logBodyHeight())
 		m.logTailOffset = msg.chunk.EndOffset
 		m.logGeneration = msg.chunk.Generation
 		return m, m.subscribeCurrentLog()
@@ -100,6 +101,10 @@ func (m Model) handleLogEvent(msg logEventMsg) (tea.Model, tea.Cmd) {
 	}
 	if msg.event.Lagged {
 		m.setStatus("Log stream lagged; resynchronizing", true)
+		return m.reloadLogTail(m.logs.Buffer.Follow)
+	}
+	if msg.event.Gap {
+		m.setStatus("Log continuity lost; reloading active file", true)
 		return m.reloadLogTail(m.logs.Buffer.Follow)
 	}
 	chunk := msg.event.Chunk

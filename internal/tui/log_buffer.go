@@ -33,6 +33,8 @@ type LogLine struct {
 	StartOffset int64
 	EndOffset   int64
 	bytes       int
+	raw         []byte
+	partial     bool
 }
 
 // LogBuffer is the framework-independent state of the log viewer. Offsets are
@@ -60,6 +62,10 @@ func NewLogBuffer() LogBuffer {
 }
 
 func (b *LogBuffer) Reset(chunk akidlog.LogChunk, follow bool) {
+	b.reset(chunk, follow, !follow)
+}
+
+func (b *LogBuffer) reset(chunk akidlog.LogChunk, follow, keepHead bool) {
 	b.Lines = parseLogLines(chunk)
 	b.Generation = chunk.Generation
 	b.Follow = follow
@@ -67,7 +73,7 @@ func (b *LogBuffer) Reset(chunk akidlog.LogChunk, follow bool) {
 	b.Horizontal = 0
 	b.selection = selectionNone
 	b.recount()
-	b.trim(false)
+	b.trim(keepHead)
 	if len(b.Lines) == 0 {
 		b.StartOffset = chunk.StartOffset
 		b.EndOffset = chunk.EndOffset
@@ -102,6 +108,22 @@ func (b *LogBuffer) Prepend(chunk akidlog.LogChunk) bool {
 	if len(parsed) == 0 {
 		return true
 	}
+	if len(b.Lines) > 0 {
+		last := len(parsed) - 1
+		if parsed[last].partial && parsed[last].EndOffset == b.Lines[0].StartOffset {
+			prefixRunes := runeCount(parsed[last].Text)
+			parsed[last] = mergeLogLines(parsed[last], b.Lines[0])
+			b.Lines = b.Lines[1:]
+			if b.CursorLine == 0 {
+				b.CursorCol += prefixRunes
+			}
+			b.CursorLine--
+			b.ViewTop--
+			if b.selection != selectionNone {
+				b.CancelSelection()
+			}
+		}
+	}
 	shift := len(parsed)
 	b.Lines = append(parsed, b.Lines...)
 	b.CursorLine += shift
@@ -109,9 +131,7 @@ func (b *LogBuffer) Prepend(chunk akidlog.LogChunk) bool {
 	if b.selection != selectionNone {
 		b.anchor.Line += shift
 	}
-	for _, line := range parsed {
-		b.loadedBytes += line.bytes
-	}
+	b.recount()
 	b.trim(true)
 	b.syncOffsets()
 	return true
@@ -136,12 +156,20 @@ func (b *LogBuffer) Append(chunk akidlog.LogChunk) bool {
 		b.EOF = chunk.EOF
 		return true
 	}
-	b.Lines = append(b.Lines, parsed...)
-	for _, line := range parsed {
-		b.loadedBytes += line.bytes
+	if len(b.Lines) > 0 {
+		last := len(b.Lines) - 1
+		if b.Lines[last].partial && b.Lines[last].EndOffset == parsed[0].StartOffset {
+			parsed[0] = mergeLogLines(b.Lines[last], parsed[0])
+			b.Lines = b.Lines[:last]
+		}
 	}
+	b.Lines = append(b.Lines, parsed...)
+	b.recount()
 	b.EOF = chunk.EOF
 	b.trim(false)
+	if len(b.Lines) == 0 {
+		b.StartOffset, b.EndOffset = chunk.EndOffset, chunk.EndOffset
+	}
 	b.syncOffsets()
 	if b.Follow && len(b.Lines) > 0 {
 		b.CursorLine = len(b.Lines) - 1
@@ -163,18 +191,31 @@ func (b *LogBuffer) MoveColumn(delta int) {
 	if len(b.Lines) == 0 {
 		return
 	}
-	b.CursorCol = clamp(b.CursorCol+delta, 0, runeCount(b.Lines[b.CursorLine].Text))
+	for delta != 0 {
+		direction := 1
+		if delta < 0 {
+			direction = -1
+		}
+		b.CursorCol = moveTextColumn(b.Lines[b.CursorLine].Text, b.CursorCol, direction)
+		delta -= direction
+	}
 }
 
 func (b *LogBuffer) EnsureCursorHorizontal(width int) {
 	if width < 1 {
 		width = 1
 	}
-	if b.CursorCol < b.Horizontal {
-		b.Horizontal = b.CursorCol
+	if len(b.Lines) == 0 {
+		return
 	}
-	if b.CursorCol >= b.Horizontal+width {
-		b.Horizontal = b.CursorCol - width + 1
+	text := b.Lines[b.CursorLine].Text
+	column := textCellColumn(text, b.CursorCol)
+	end := max(column+1, textCellColumn(text, moveTextColumn(text, b.CursorCol, 1)))
+	if column < b.Horizontal {
+		b.Horizontal = column
+	}
+	if end > b.Horizontal+width {
+		b.Horizontal = end - width
 	}
 }
 
@@ -226,7 +267,7 @@ func (b *LogBuffer) SelectedText() string {
 			from = clamp(start.Col, 0, len(runes))
 		}
 		if i == end.Line {
-			to = clamp(end.Col+1, 0, len(runes))
+			to = moveTextColumn(b.Lines[i].Text, end.Col, 1)
 		}
 		if from > to {
 			from = to
@@ -254,7 +295,7 @@ func (b *LogBuffer) SelectionRange(line int) (start, end int, selected bool) {
 		start = clamp(first.Col, 0, length)
 	}
 	if line == last.Line {
-		end = clamp(last.Col+1, 0, length)
+		end = moveTextColumn(b.Lines[line].Text, last.Col, 1)
 	}
 	return start, end, true
 }
@@ -308,6 +349,24 @@ func (b *LogBuffer) trim(fromEnd bool) {
 	for len(b.Lines) > MaxLogLines || b.loadedBytes > MaxLogBytes {
 		if len(b.Lines) == 0 {
 			break
+		}
+		if len(b.Lines) == 1 && b.Lines[0].bytes > MaxLogBytes {
+			line := b.Lines[0]
+			// Keep a bounded fragment of a line larger than the whole window.
+			// Account for both the raw bytes and the sanitized display text.
+			drop := max(1, len(line.raw)/2)
+			if fromEnd {
+				line.raw = line.raw[:len(line.raw)-drop]
+				line.EndOffset -= int64(drop)
+				droppedEnd = true
+			} else {
+				line.raw = line.raw[drop:]
+				line.StartOffset += int64(drop)
+			}
+			b.Lines = parseLogLines(akidlog.LogChunk{StartOffset: line.StartOffset, Data: line.raw})
+			b.CancelSelection()
+			b.recount()
+			continue
 		}
 		if fromEnd {
 			last := len(b.Lines) - 1
@@ -379,12 +438,21 @@ func parseLogLines(chunk akidlog.LogChunk) []LogLine {
 			Text:        text,
 			StartOffset: offset,
 			EndOffset:   offset + int64(consumed),
-			bytes:       max(consumed, len(text)),
+			bytes:       consumed + len(text),
+			raw:         bytes.Clone(chunk.Data[:consumed]),
+			partial:     i < 0,
 		})
 		offset += int64(consumed)
 		chunk.Data = chunk.Data[consumed:]
 	}
 	return lines
+}
+
+func mergeLogLines(first, second LogLine) LogLine {
+	data := make([]byte, 0, len(first.raw)+len(second.raw))
+	data = append(data, first.raw...)
+	data = append(data, second.raw...)
+	return parseLogLines(akidlog.LogChunk{StartOffset: first.StartOffset, Data: data})[0]
 }
 
 func sanitizeLogText(raw []byte) string {

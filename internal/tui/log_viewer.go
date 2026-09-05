@@ -6,6 +6,7 @@ import (
 
 	"charm.land/bubbles/v2/textinput"
 	"charm.land/lipgloss/v2"
+	"github.com/charmbracelet/x/ansi"
 
 	"akid/internal/model"
 )
@@ -95,15 +96,13 @@ func (v *LogViewer) renderBody(width, height int) string {
 func (v *LogViewer) renderLine(index, width int) string {
 	line := v.Buffer.Lines[index].Text
 	runes := []rune(line)
-	left := clamp(v.Buffer.Horizontal, 0, len(runes))
-	right := min(len(runes), left+width)
-	visible := runes[left:right]
+	visible := runes
 
 	start, end, selected := v.Buffer.SelectionRange(index)
 	var rendered string
 	if selected {
-		start = clamp(start-left, 0, len(visible))
-		end = clamp(end-left, 0, len(visible))
+		start = clamp(start, 0, len(visible))
+		end = clamp(end, 0, len(visible))
 		if start > end {
 			start = end
 		}
@@ -121,7 +120,7 @@ func (v *LogViewer) renderLine(index, width int) string {
 	if index == v.Buffer.CursorLine && v.Buffer.SelectionMode() == selectionNone {
 		rendered = cursorLineStyle.Render(rendered)
 	}
-	return lipgloss.NewStyle().Inline(true).MaxWidth(width).Render(rendered)
+	return lipgloss.NewStyle().Inline(true).MaxWidth(width).Render(ansi.Cut(rendered, v.Buffer.Horizontal, v.Buffer.Horizontal+width))
 }
 
 func (v *LogViewer) renderStatus(width int, message string, isError bool) string {

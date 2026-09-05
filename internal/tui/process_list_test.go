@@ -22,6 +22,51 @@ func TestProcessListLiveSearchCanBeCanceled(t *testing.T) {
 	}
 }
 
+func TestProcessListRejectsStaleActionsAndDeletedRows(t *testing.T) {
+	list := newProcessList()
+	info := processInfo("api", "1")
+	info.Epoch, info.Revision = "daemon-a", 1
+	list.ApplySnapshot(model.ProcessSnapshot{Epoch: info.Epoch, Revision: 1, Processes: []model.ProcessInfo{info}})
+	stopped := info
+	stopped.Revision, stopped.Runtime.Status = 3, model.StatusStopped
+	if !list.ApplyChange(stopped, false) {
+		t.Fatal("new event rejected")
+	}
+	info.Revision = 2
+	if list.ApplyChange(info, false) || list.all[0].Runtime.Status != model.StatusStopped {
+		t.Fatal("old response replaced newer event")
+	}
+	deleted := stopped
+	deleted.Revision = 4
+	list.ApplyChange(deleted, true)
+	if list.ApplyChange(stopped, false) || len(list.all) != 0 {
+		t.Fatal("late response resurrected deleted process")
+	}
+	list.ApplySnapshot(model.ProcessSnapshot{Epoch: info.Epoch, Revision: 2, Processes: []model.ProcessInfo{info}})
+	if len(list.all) != 0 {
+		t.Fatal("stale snapshot resurrected deleted process")
+	}
+	info.Epoch, info.Revision = "daemon-b", 1
+	list.ApplySnapshot(model.ProcessSnapshot{Epoch: info.Epoch, Revision: 1, Processes: []model.ProcessInfo{info}})
+	if list.ApplyChange(deleted, true) || len(list.all) != 1 {
+		t.Fatal("old daemon response affected new daemon state")
+	}
+}
+
+func TestSnapshotPreservesNewerActionResponse(t *testing.T) {
+	list := newProcessList()
+	info := processInfo("api", "1")
+	info.Epoch, info.Revision = "daemon", 1
+	list.ApplySnapshot(model.ProcessSnapshot{Epoch: "daemon", Revision: 1, Processes: []model.ProcessInfo{info}})
+	newer := info
+	newer.Revision, newer.Runtime.Status = 5, model.StatusStopped
+	list.ApplyChange(newer, false)
+	list.ApplySnapshot(model.ProcessSnapshot{Epoch: "daemon", Revision: 3, Processes: []model.ProcessInfo{info}})
+	if len(list.all) != 1 || list.all[0].Revision != 5 {
+		t.Fatal("snapshot overwrote later action")
+	}
+}
+
 func TestProcessListSortFilterAndPreserveSelection(t *testing.T) {
 	list := newProcessList()
 	list.Set([]model.ProcessInfo{

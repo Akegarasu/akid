@@ -36,7 +36,8 @@ func coded(code, format string, args ...any) error {
 }
 
 type LogRegistry interface {
-	Register(name string) error
+	Register(name string, owner ...string) error
+	Remove(name, owner string, purge bool) error
 	Paths(name string) (stdout, stderr string)
 	Generation(name string, stream model.LogStream) uint64
 }
@@ -47,14 +48,16 @@ type Manager struct {
 	logs   LogRegistry
 	logger *log.Logger
 
-	events  chan any
-	done    chan struct{}
-	lifeMu  sync.RWMutex
-	closed  bool
-	records map[string]*record
-	names   map[string]string
-	subs    map[uint64]chan model.Event
-	nextSub atomic.Uint64
+	events   chan any
+	done     chan struct{}
+	lifeMu   sync.RWMutex
+	closed   bool
+	records  map[string]*record
+	names    map[string]string
+	subs     map[uint64]chan model.Event
+	nextSub  atomic.Uint64
+	epoch    string
+	revision uint64
 
 	shuttingDown bool
 	terminated   bool
@@ -62,11 +65,12 @@ type Manager struct {
 }
 
 type record struct {
-	config  model.ProcessConfig
-	desired model.DesiredState
-	runtime model.RuntimeState
-	hint    *model.RuntimeHint
-	proc    *executor.RunningProcess
+	revision uint64
+	config   model.ProcessConfig
+	desired  model.DesiredState
+	runtime  model.RuntimeState
+	hint     *model.RuntimeHint
+	proc     *executor.RunningProcess
 
 	startedMono  time.Time
 	crashStreak  uint
@@ -140,7 +144,12 @@ func New(store storage.Store, exec executor.Executor, logs LogRegistry, logger *
 	if err != nil {
 		return nil, err
 	}
+	epoch, err := model.NewID()
+	if err != nil {
+		return nil, err
+	}
 	m := &Manager{
+		epoch:   epoch,
 		store:   store,
 		exec:    exec,
 		logs:    logs,
@@ -153,7 +162,7 @@ func New(store storage.Store, exec executor.Executor, logs LogRegistry, logger *
 	}
 	for _, persisted := range state.Processes {
 		cfg := cloneConfig(persisted.ProcessConfig)
-		if err := logs.Register(cfg.Name); err != nil {
+		if err := logs.Register(cfg.Name, cfg.ID); err != nil {
 			return nil, fmt.Errorf("prepare logs for %s: %w", cfg.Name, err)
 		}
 		status := model.StatusStopped
@@ -329,6 +338,7 @@ func (m *Manager) loop() {
 		case subscribeCmd:
 			id := m.nextSub.Add(1)
 			m.subs[id] = e.ch
+			e.ch <- model.Event{Name: "process.snapshot", Snapshot: &model.ProcessSnapshot{Epoch: m.epoch, Revision: m.revision, Processes: m.list()}}
 			e.reply <- opResult{value: id}
 		case unsubscribeEvent:
 			if ch, ok := m.subs[e.id]; ok {
@@ -355,13 +365,6 @@ func (m *Manager) loop() {
 func (m *Manager) restore() error {
 	changed := false
 	for _, r := range m.records {
-		if r.desired == model.DesiredStopped {
-			if r.hint != nil {
-				r.hint = nil
-				changed = true
-			}
-			continue
-		}
 		if r.hint != nil && m.exec.Alive(r.hint.PID, r.hint.StartTime) {
 			proc, err := m.exec.Adopt(r.hint.PID, r.hint.StartTime)
 			if err == nil {
@@ -376,12 +379,19 @@ func (m *Manager) restore() error {
 				r.runtime.StartedAt = startedAt
 				r.startedMono = startedAt
 				m.watch(r.config.ID, proc)
-				m.emit("process.started", r)
+				if r.desired == model.DesiredStopped {
+					m.beginStop(r)
+				} else {
+					m.emit("process.started", r)
+				}
 				continue
 			}
 		}
 		r.hint = nil
 		changed = true
+		if r.desired == model.DesiredStopped {
+			continue
+		}
 		if err := m.spawn(r, false); err != nil {
 			if !r.runtime.NextRetryAt.IsZero() {
 				m.logf("restore %s: %v; retry scheduled at %s", r.config.Name, err, r.runtime.NextRetryAt.Format(time.RFC3339))
@@ -422,7 +432,7 @@ func (m *Manager) handleCreate(cmd createCmd) {
 		cmd.reply <- opResult{err: coded(CodeInvalidConfig, "process id %q already exists", cfg.ID)}
 		return
 	}
-	if err := m.logs.Register(cfg.Name); err != nil {
+	if err := m.logs.Register(cfg.Name, cfg.ID); err != nil {
 		cmd.reply <- opResult{err: coded(CodeInternal, "prepare logs: %v", err)}
 		return
 	}
@@ -432,6 +442,7 @@ func (m *Manager) handleCreate(cmd createCmd) {
 	if err := m.persist(); err != nil {
 		delete(m.records, cfg.ID)
 		delete(m.names, cfg.Name)
+		_ = m.logs.Remove(cfg.Name, cfg.ID, false)
 		cmd.reply <- opResult{err: coded(CodeInternal, "save state: %v", err)}
 		return
 	}
@@ -468,6 +479,7 @@ func (m *Manager) handleAction(cmd actionCmd) {
 		cmd.reply <- opResult{err: err}
 		return
 	}
+	m.emit("process.updated", r)
 	cmd.reply <- opResult{value: m.info(r)}
 }
 
@@ -653,28 +665,7 @@ func (m *Manager) handleExit(event exitEvent) {
 
 	if r.deleting {
 		r.runtime.Status = model.StatusStopped
-		info := m.info(r)
-		name := r.config.Name
-		waiters := r.deleteWait
-		delete(m.names, name)
-		delete(m.records, r.config.ID)
-		if err := m.persist(); err != nil {
-			// Keep the in-memory and durable views consistent if the atomic
-			// state update fails. The process remains stopped and manageable.
-			r.deleting = false
-			r.deleteWait = nil
-			m.records[r.config.ID] = r
-			m.names[name] = r.config.ID
-			for _, waiter := range waiters {
-				waiter.ch <- opResult{err: coded(CodeInternal, "save state: %v", err)}
-			}
-			m.checkShutdownComplete()
-			return
-		}
-		m.broadcast(model.Event{Name: "process.stopped", Data: info})
-		for _, waiter := range waiters {
-			waiter.ch <- opResult{value: DeleteResult{Name: name, Purge: waiter.purge}}
-		}
+		m.finishDelete(r)
 		m.checkShutdownComplete()
 		return
 	}
@@ -783,17 +774,8 @@ func (m *Manager) handleDelete(cmd deleteCmd) {
 		return
 	}
 	if r.runtime.Status == model.StatusStopped || r.runtime.Status == model.StatusExited {
-		name := r.config.Name
-		delete(m.names, name)
-		delete(m.records, r.config.ID)
-		if err := m.persist(); err != nil {
-			m.records[r.config.ID] = r
-			m.names[name] = r.config.ID
-			cmd.reply <- opResult{err: coded(CodeInternal, "save state: %v", err)}
-			return
-		}
-		m.cancelBackoff(r)
-		cmd.reply <- opResult{value: DeleteResult{Name: name, Purge: cmd.purge}}
+		r.deleteWait = append(r.deleteWait, deleteWaiter{purge: cmd.purge, ch: cmd.reply})
+		m.finishDelete(r)
 		return
 	}
 	r.deleting = true
@@ -805,13 +787,57 @@ func (m *Manager) handleDelete(cmd deleteCmd) {
 	_ = m.persistAsync("delete stop")
 }
 
+func (m *Manager) finishDelete(r *record) {
+	waiters := r.deleteWait
+	r.deleteWait = nil
+	purge := false
+	for _, waiter := range waiters {
+		purge = purge || waiter.purge
+	}
+	delete(m.records, r.config.ID)
+	if err := m.persist(); err != nil {
+		m.records[r.config.ID] = r
+		r.deleting = false
+		m.emit("process.updated", r)
+		for _, waiter := range waiters {
+			waiter.ch <- opResult{err: coded(CodeInternal, "save state: %v", err)}
+		}
+		return
+	}
+	m.cancelBackoff(r)
+	// The state owner retains the name until identity-checked log cleanup
+	// finishes. A concurrent create cannot acquire the name in between.
+	err := m.logs.Remove(r.config.Name, r.config.ID, purge)
+	if err != nil {
+		m.records[r.config.ID] = r
+		r.deleting = false
+		r.desired = model.DesiredStopped
+		r.runtime.Status = model.StatusStopped
+		_ = m.persistAsync("failed log cleanup")
+		m.emit("process.updated", r)
+		for _, waiter := range waiters {
+			waiter.ch <- opResult{err: coded(CodeInternal, "remove logs: %v", err)}
+		}
+		return
+	}
+	delete(m.names, r.config.Name)
+	m.emit("process.deleted", r)
+	for _, waiter := range waiters {
+		waiter.ch <- opResult{value: DeleteResult{Name: r.config.Name, Purge: waiter.purge}}
+	}
+}
+
 func (m *Manager) handleList(cmd listCmd) {
+	cmd.reply <- opResult{value: m.list()}
+}
+
+func (m *Manager) list() []model.ProcessInfo {
 	list := make([]model.ProcessInfo, 0, len(m.records))
 	for _, r := range m.records {
 		list = append(list, m.info(r))
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].Config.Name < list[j].Config.Name })
-	cmd.reply <- opResult{value: list}
+	return list
 }
 
 func (m *Manager) handleGet(cmd getCmd) {
@@ -903,6 +929,8 @@ func (m *Manager) find(id string) *record {
 
 func (m *Manager) info(r *record) model.ProcessInfo {
 	return model.ProcessInfo{
+		Epoch:         m.epoch,
+		Revision:      r.revision,
 		Config:        cloneConfig(r.config),
 		Desired:       r.desired,
 		Runtime:       r.runtime,
@@ -912,6 +940,8 @@ func (m *Manager) info(r *record) model.ProcessInfo {
 }
 
 func (m *Manager) emit(name string, r *record) {
+	m.revision++
+	r.revision = m.revision
 	m.broadcast(model.Event{Name: name, Data: m.info(r)})
 }
 

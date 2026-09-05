@@ -144,3 +144,71 @@ func lineTexts(lines []LogLine) string {
 	}
 	return strings.Join(values, "|")
 }
+
+func TestLogBufferTopRetainsBeginningWhenOverLineLimit(t *testing.T) {
+	buffer := NewLogBuffer()
+	data := "first\n" + strings.Repeat("line\n", MaxLogLines) + "last\n"
+	buffer.Reset(chunk(0, 1, data), false)
+	if buffer.StartOffset != 0 || buffer.Lines[0].Text != "first" || buffer.EOF {
+		t.Fatalf("top skipped the start: offset=%d eof=%v", buffer.StartOffset, buffer.EOF)
+	}
+}
+
+func TestLogBufferJoinsSplitUTF8AndCRLF(t *testing.T) {
+	data := []byte("start \u4e2d\u6587\r\nnext")
+	for split := 1; split < len(data); split++ {
+		t.Run(fmt.Sprint(split), func(t *testing.T) {
+			buffer := NewLogBuffer()
+			buffer.Reset(chunk(0, 1, string(data[:split])), true)
+			if !buffer.Append(chunk(int64(split), 1, string(data[split:]))) {
+				t.Fatal("append rejected")
+			}
+			if got := lineTexts(buffer.Lines); got != "start \u4e2d\u6587|next" {
+				t.Fatalf("split corrupted log: %q", got)
+			}
+			before := NewLogBuffer()
+			before.Reset(chunk(int64(split), 1, string(data[split:])), false)
+			if !before.Prepend(chunk(0, 1, string(data[:split]))) {
+				t.Fatal("prepend rejected")
+			}
+			if got := lineTexts(before.Lines); got != "start \u4e2d\u6587|next" {
+				t.Fatalf("prepend corrupted log: %q", got)
+			}
+		})
+	}
+}
+
+func TestLogBufferBoundsOneHugeLine(t *testing.T) {
+	buffer := NewLogBuffer()
+	data := strings.Repeat("x", MaxLogBytes+100)
+	buffer.Reset(chunk(0, 1, data), true)
+	if buffer.loadedBytes > MaxLogBytes || len(buffer.Lines) == 0 || buffer.EndOffset != int64(len(data)) {
+		t.Fatalf("huge line not bounded: bytes=%d lines=%d end=%d", buffer.loadedBytes, len(buffer.Lines), buffer.EndOffset)
+	}
+	buffer.Append(chunk(buffer.EndOffset, 1, "end\n"))
+	if !strings.HasSuffix(buffer.Lines[len(buffer.Lines)-1].Text, "end") {
+		t.Fatal("lost huge line continuation")
+	}
+}
+
+func TestWideAndJoinedCharactersUseTerminalCells(t *testing.T) {
+	text := "a\u4e2d\U0001f469\u200d\U0001f4bbz"
+	if textRuneAtCell(text, 2) != 1 || textRuneAtCell(text, 4) != 2 || textRuneAtCell(text, 5) != 5 {
+		t.Fatal("cell-to-character mapping split a wide grapheme")
+	}
+	buffer := NewLogBuffer()
+	buffer.Reset(chunk(0, 1, text+"\n"), false)
+	buffer.MoveColumn(2)
+	buffer.ToggleSelection(selectionCharacter)
+	if got := buffer.SelectedText(); got != "\U0001f469\u200d\U0001f4bb" {
+		t.Fatalf("selected partial grapheme: %q", got)
+	}
+	buffer.EnsureCursorHorizontal(4)
+	if buffer.Horizontal != 1 {
+		t.Fatalf("wide cursor clipped: horizontal=%d", buffer.Horizontal)
+	}
+	buffer.MoveColumn(1)
+	if buffer.CursorCol != 5 {
+		t.Fatalf("cursor split emoji: %d", buffer.CursorCol)
+	}
+}

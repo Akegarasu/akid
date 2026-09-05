@@ -15,7 +15,7 @@ import (
 )
 
 const (
-	Version        = 1
+	Version        = 2
 	MaxMessageSize = 16 << 20
 )
 
@@ -133,6 +133,18 @@ func (c *Client) SubscribeEvents(ctx context.Context) (<-chan model.Event, error
 				return
 			}
 			var info model.ProcessInfo
+			if envelope.Event == "process.snapshot" {
+				var snapshot model.ProcessSnapshot
+				if json.Unmarshal(envelope.Data, &snapshot) != nil {
+					return
+				}
+				select {
+				case out <- model.Event{Name: envelope.Event, Snapshot: &snapshot}:
+				case <-ctx.Done():
+					return
+				}
+				continue
+			}
 			if json.Unmarshal(envelope.Data, &info) != nil {
 				return
 			}
@@ -175,7 +187,7 @@ func (c *Client) SubscribeLogs(ctx context.Context, params LogSubscribeParams) (
 				}
 				return
 			}
-			if envelope.Event != "log.append" {
+			if envelope.Event != "log.append" && envelope.Event != "log.gap" {
 				continue
 			}
 			var event logging.LogEvent

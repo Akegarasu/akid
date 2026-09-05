@@ -27,6 +27,10 @@ type RunningProcess struct {
 	Adopted   bool
 }
 
+// Done reports the leader's exit only after its process group has no live
+// members. Adopted processes report an unknown exit code. Alive validates an
+// identity, including an unreaped leader needed to finish group cleanup.
+
 type Executor interface {
 	Start(model.ProcessConfig, LogPaths) (*RunningProcess, error)
 	Adopt(pid int, startTime uint64) (*RunningProcess, error)

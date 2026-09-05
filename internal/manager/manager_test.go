@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"log"
 	"sync"
@@ -48,7 +49,8 @@ func cloneState(state *model.PersistedState) *model.PersistedState {
 
 type fakeLogs struct{}
 
-func (fakeLogs) Register(string) error { return nil }
+func (fakeLogs) Register(string, ...string) error  { return nil }
+func (fakeLogs) Remove(string, string, bool) error { return nil }
 func (fakeLogs) Paths(name string) (string, string) {
 	return name + ".out", name + ".err"
 }
@@ -312,4 +314,148 @@ func waitForStatus(t *testing.T, mgr *Manager, id string, wanted model.ProcessSt
 	info, err := mgr.Get(context.Background(), id)
 	t.Fatalf("timed out waiting for %s: info=%#v err=%v", wanted, info, err)
 	return model.ProcessInfo{}
+}
+
+func TestRestoreFinishesInterruptedStop(t *testing.T) {
+	for _, stale := range []bool{false, true} {
+		t.Run(fmt.Sprint(stale), func(t *testing.T) {
+			store := newMemoryStore()
+			exec := newFakeExecutor()
+			proc, err := exec.Start(model.ProcessConfig{}, executor.LogPaths{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			token := proc.StartTime
+			if stale {
+				token++
+			}
+			store.state.Processes = []model.PersistedProcess{{ProcessConfig: model.ProcessConfig{ID: "id", Name: "api", Command: "fake", Restart: model.RestartAlways}, Desired: model.DesiredStopped, Hint: &model.RuntimeHint{PID: proc.PID, StartTime: token}}}
+			mgr, err := New(store, exec, fakeLogs{}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer mgr.Shutdown(context.Background())
+			waitForStatus(t, mgr, "api", model.StatusStopped, time.Second)
+			if alive := exec.Alive(proc.PID, proc.StartTime); alive != stale {
+				t.Fatalf("identity safety/stop failed: alive=%v stale=%v", alive, stale)
+			}
+			state, err := store.Load()
+			if err != nil || state.Processes[0].Hint != nil || state.Processes[0].Desired != model.DesiredStopped {
+				t.Fatalf("bad recovered state: %+v %v", state, err)
+			}
+			if exec.startCount() != 1 {
+				t.Fatal("recovery spawned a stopped process")
+			}
+		})
+	}
+}
+
+func TestSubscriptionSnapshotAndDeletionAreOrdered(t *testing.T) {
+	for _, running := range []bool{false, true} {
+		t.Run(fmt.Sprint(running), func(t *testing.T) {
+			mgr, _, _, created := newTestManager(t, model.RestartNever)
+			if running {
+				if _, err := mgr.Start(context.Background(), created.Config.ID); err != nil {
+					t.Fatal(err)
+				}
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+			events, err := mgr.Subscribe(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			first := <-events
+			if first.Snapshot == nil || len(first.Snapshot.Processes) != 1 {
+				t.Fatalf("missing initial snapshot: %+v", first)
+			}
+			if _, err := mgr.Delete(ctx, created.Config.ID, false); err != nil {
+				t.Fatal(err)
+			}
+			lastRevision := first.Snapshot.Revision
+			for {
+				select {
+				case event := <-events:
+					if event.Data.Epoch != first.Snapshot.Epoch || event.Data.Revision <= lastRevision {
+						t.Fatalf("unordered event: %+v", event)
+					}
+					lastRevision = event.Data.Revision
+					if event.Name == "process.deleted" {
+						return
+					}
+				case <-ctx.Done():
+					t.Fatal("deletion event missing")
+				}
+			}
+		})
+	}
+}
+
+type blockingLogs struct {
+	fakeLogs
+	entered chan struct{}
+	release chan struct{}
+	mu      sync.Mutex
+	owner   string
+}
+
+func (l *blockingLogs) Register(_ string, owners ...string) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if l.owner != "" {
+		return errors.New("name still owned")
+	}
+	l.owner = owners[0]
+	return nil
+}
+
+func (l *blockingLogs) Remove(_, owner string, purge bool) error {
+	if purge {
+		close(l.entered)
+		<-l.release
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if owner != l.owner {
+		return errors.New("wrong owner")
+	}
+	l.owner = ""
+	return nil
+}
+
+func TestDeleteKeepsNameReservedUntilLogCleanup(t *testing.T) {
+	logs := &blockingLogs{entered: make(chan struct{}), release: make(chan struct{})}
+	mgr, err := New(newMemoryStore(), newFakeExecutor(), logs, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer mgr.Shutdown(context.Background())
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cfg := model.ProcessConfig{Name: "api", Command: "fake"}
+	if _, err := mgr.Create(ctx, cfg); err != nil {
+		t.Fatal(err)
+	}
+	deleted := make(chan error, 1)
+	go func() { _, err := mgr.Delete(ctx, "api", true); deleted <- err }()
+	select {
+	case <-logs.entered:
+	case <-ctx.Done():
+		t.Fatal("cleanup did not begin")
+	}
+	created := make(chan error, 1)
+	go func() { _, err := mgr.Create(ctx, cfg); created <- err }()
+	select {
+	case err := <-created:
+		close(logs.release)
+		t.Fatalf("create finished during purge: %v", err)
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(logs.release)
+	if err := <-deleted; err != nil {
+		t.Fatal(err)
+	}
+	if err := <-created; err != nil {
+		t.Fatal(err)
+	}
 }

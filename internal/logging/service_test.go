@@ -1,6 +1,7 @@
 package logging
 
 import (
+	"bytes"
 	"context"
 	"os"
 	"testing"
@@ -23,7 +24,7 @@ func TestReadAlignsToCompleteLines(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	chunk, err := service.Read(LogReadRequest{Name: "api", Stream: model.LogStdout, Offset: 2, Limit: 100})
+	chunk, err := service.Read(LogReadRequest{Name: "api", Stream: model.LogStdout, Offset: 2, Limit: 100, Align: true})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -40,7 +41,7 @@ func TestReadAlignsToCompleteLines(t *testing.T) {
 	}
 }
 
-func TestReadBuffersUnterminatedFinalLine(t *testing.T) {
+func TestReadReturnsUnterminatedFinalLine(t *testing.T) {
 	service, err := NewService(t.TempDir(), 1<<20, 2)
 	if err != nil {
 		t.Fatal(err)
@@ -56,8 +57,8 @@ func TestReadBuffersUnterminatedFinalLine(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(chunk.Data) != 0 || chunk.EndOffset != 0 || chunk.EOF {
-		t.Fatalf("unterminated line should remain buffered: %#v", chunk)
+	if string(chunk.Data) != "partial" || chunk.EndOffset != 7 || !chunk.EOF || !chunk.PartialEnd {
+		t.Fatalf("unterminated line must remain readable: %#v", chunk)
 	}
 }
 
@@ -72,6 +73,7 @@ func TestRotateCopyTruncateAndGeneration(t *testing.T) {
 	}
 	path := service.Path("api", model.LogStdout)
 	content := []byte("line1\nline2\n")
+	generation := service.Generation("api", model.LogStdout)
 	if err := os.WriteFile(path, content, 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -89,8 +91,8 @@ func TestRotateCopyTruncateAndGeneration(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if info.Size() != 0 || service.Generation("api", model.LogStdout) != 1 {
-		t.Fatalf("rotation did not truncate/increment generation: size=%d generation=%d", info.Size(), service.Generation("api", model.LogStdout))
+	if info.Size() != 0 || service.Generation("api", model.LogStdout) == generation {
+		t.Fatalf("rotation did not truncate/change generation: size=%d generation=%d", info.Size(), service.Generation("api", model.LogStdout))
 	}
 }
 
@@ -133,7 +135,7 @@ func TestSubscribeFollowsAppends(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
-	events, err := service.Subscribe(ctx, "api", model.LogStdout, 0, 0)
+	events, err := service.Subscribe(ctx, "api", model.LogStdout, 0, service.Generation("api", model.LogStdout))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -152,5 +154,119 @@ func TestSubscribeFollowsAppends(t *testing.T) {
 		}
 	case <-ctx.Done():
 		t.Fatal("timed out waiting for append")
+	}
+}
+
+func TestReadLongLineContinuationsAreLossless(t *testing.T) {
+	service, err := NewService(t.TempDir(), 1<<20, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	if err := service.Register("api"); err != nil {
+		t.Fatal(err)
+	}
+	data := append(bytes.Repeat([]byte("x"), (64<<10)+13), []byte("\nlast without newline")...)
+	if err := os.WriteFile(service.Path("api", model.LogStdout), data, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var got []byte
+	var cursor int64
+	for i := 0; i < 10; i++ {
+		chunk, err := service.Read(LogReadRequest{Name: "api", Stream: model.LogStdout, Offset: cursor, Limit: 64 << 10})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if chunk.StartOffset != cursor {
+			t.Fatalf("skipped bytes: %d -> %d", cursor, chunk.StartOffset)
+		}
+		got = append(got, chunk.Data...)
+		cursor = chunk.EndOffset
+		if chunk.EOF {
+			break
+		}
+	}
+	if !bytes.Equal(got, data) {
+		t.Fatalf("read %d of %d bytes", len(got), len(data))
+	}
+}
+
+func TestSubscriptionReportsGapAfterServiceRestart(t *testing.T) {
+	dir := t.TempDir()
+	old, err := NewService(dir, 1<<20, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := old.Register("api"); err != nil {
+		t.Fatal(err)
+	}
+	generation := old.Generation("api", model.LogStdout)
+	old.Close()
+	service, err := NewService(dir, 1<<20, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	if err := service.Register("api"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	events, err := service.Subscribe(ctx, "api", model.LogStdout, 500, generation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case event := <-events:
+		if !event.Gap || event.Chunk.Generation == generation {
+			t.Fatalf("missing restart gap: %#v", event)
+		}
+	case <-ctx.Done():
+		t.Fatal("no gap for empty active file")
+	}
+}
+
+func TestRemoveChecksOwnerAndDetachesOldSubscriptions(t *testing.T) {
+	service, err := NewService(t.TempDir(), 1<<20, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer service.Close()
+	if err := service.Register("api", "old"); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	events, err := service.Subscribe(ctx, "api", model.LogStdout, 0, service.Generation("api", model.LogStdout))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Remove("api", "wrong", true); err == nil {
+		t.Fatal("accepted wrong owner")
+	}
+	if err := service.Remove("api", "old", true); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Register("api", "new"); err != nil {
+		t.Fatal(err)
+	}
+	path := service.Path("api", model.LogStdout)
+	if err := os.WriteFile(path, []byte("new process\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := service.Remove("api", "old", true); err == nil {
+		t.Fatal("old cleanup deleted new process logs")
+	}
+	select {
+	case event, open := <-events:
+		if open {
+			t.Fatalf("old subscriber followed new process: %#v", event)
+		}
+	case <-ctx.Done():
+		t.Fatal("old subscription did not close")
+	}
+	data, err := os.ReadFile(path)
+	if err != nil || string(data) != "new process\n" {
+		t.Fatalf("new logs changed: %q %v", data, err)
 	}
 }

@@ -130,6 +130,8 @@ type RuntimeState struct {
 }
 
 type ProcessInfo struct {
+	Epoch         string        `json:"epoch,omitempty"`
+	Revision      uint64        `json:"revision,omitempty"`
 	Config        ProcessConfig `json:"config"`
 	Desired       DesiredState  `json:"desired"`
 	Runtime       RuntimeState  `json:"runtime"`
@@ -147,6 +149,13 @@ type ProcessMetrics struct {
 }
 
 type Event struct {
-	Name string      `json:"event"`
-	Data ProcessInfo `json:"data"`
+	Name     string           `json:"event"`
+	Data     ProcessInfo      `json:"data"`
+	Snapshot *ProcessSnapshot `json:"snapshot,omitempty"`
+}
+
+type ProcessSnapshot struct {
+	Epoch     string        `json:"epoch"`
+	Revision  uint64        `json:"revision"`
+	Processes []ProcessInfo `json:"processes"`
 }

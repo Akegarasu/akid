@@ -53,7 +53,7 @@ func TestModelLoadsAndFollowsLogs(t *testing.T) {
 	}
 	m := NewModel(context.Background(), client)
 	m.width, m.height = 80, 20
-	updated, _ := m.Update(processesLoadedMsg{processes: client.processes})
+	updated, _ := m.Update(processEventMsg{open: true, event: model.Event{Name: "process.snapshot", Snapshot: &model.ProcessSnapshot{Processes: client.processes}}})
 	m = updated.(Model)
 
 	updated, readCmd := m.Update(keyText("enter"))
@@ -220,5 +220,34 @@ func processInfo(name, id string) model.ProcessInfo {
 		Config:  model.ProcessConfig{ID: id, Name: name, Command: "./server", Restart: model.RestartAlways},
 		Runtime: model.RuntimeState{Status: model.StatusRunning, PID: 123},
 		Desired: model.DesiredRunning,
+	}
+}
+
+func TestDeletedProcessClosesLogView(t *testing.T) {
+	m := NewModel(context.Background(), &fakeClient{})
+	info := processInfo("api", "1")
+	info.Epoch, info.Revision = "daemon", 1
+	m.processes.ApplySnapshot(model.ProcessSnapshot{Epoch: "daemon", Revision: 1, Processes: []model.ProcessInfo{info}})
+	m.view = viewLogs
+	m.logs.Reset(info, model.LogStdout)
+	m.logCtx, m.logCancel = context.WithCancel(m.ctx)
+	logCtx := m.logCtx
+	info.Revision = 2
+	updated, _ := m.Update(processEventMsg{open: true, event: model.Event{Name: "process.deleted", Data: info}})
+	m = updated.(Model)
+	if m.view != viewProcesses || len(m.processes.all) != 0 || logCtx.Err() == nil {
+		t.Fatal("deleted process view remained open")
+	}
+}
+
+func TestMouseSelectsWideCharacterByDisplayCell(t *testing.T) {
+	m := NewModel(context.Background(), &fakeClient{}, Options{Mouse: true})
+	m.width, m.height = 20, 10
+	m.view = viewLogs
+	m.logs.Buffer.Reset(chunk(0, 1, "a\u4e2db\n"), false)
+	updated, _ := m.Update(tea.MouseClickMsg(tea.Mouse{X: 2, Y: 1, Button: tea.MouseLeft}))
+	m = updated.(Model)
+	if m.logs.Buffer.CursorCol != 1 {
+		t.Fatalf("wide character click landed at rune %d", m.logs.Buffer.CursorCol)
 	}
 }

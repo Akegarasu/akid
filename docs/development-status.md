@@ -83,3 +83,16 @@ daemon 和进程测试 CLI/IPC/日志/崩溃接管，systemd 安装流程使用�
 可选 WebUI（v0.5）、prune、远程访问、认证、多用户、资源限制和部署自动化仍在本轮
 范围之外。copytruncate 的写入窗口、stdout/stderr 无精确合并顺序、逃离进程组的
 独立 session 等既定边界仍然存在。
+
+## CLI 使用补充
+
+`start` 的第一个参数支持轻量 shell 风格的命令字符串。例如
+`akid start "uv run bot.py" --name chino-bot` 会保存 command=`uv`、args=`["run", "bot.py"]`。
+解析只处理空白、单/双引号和反斜杠，不执行 shell 展开、管道或重定向。
+对不含 `/` 的命令，CLI 先用自己的 PATH 解析成绝对路径再交给 daemon；这样 daemon
+由旧环境或 systemd 启动时仍可找到 `$HOME/.local/bin/uv`。找不到的命令保留原名，
+最终返回正常的 `SPAWN_FAILED`。
+
+`list` 的别名包括 `ls` 和 `ps`，输出按名称排序并带 1 起始序号。CLI 接受名称、ID
+或序号；先尝试精确名称/ID，数字没有同名进程时按当前列表序号解析。TUI 详情页
+同时展示 ID、args、cwd、时间、退出码、日志 generation 和环境变量。

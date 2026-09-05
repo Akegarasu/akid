@@ -106,6 +106,22 @@ def main():
             capabilities = rpc("daemon.capabilities")
             assert "config.apply" in capabilities["methods"], capabilities
 
+            # The CLI accepts one quoted command string and resolves a tool
+            # from its own PATH before handing it to a daemon started with a
+            # different environment (the ~/.local/bin/uv case).
+            tool_dir = root / "tools"
+            tool_dir.mkdir()
+            uv = tool_dir / "uv"
+            uv.write_text("#!/bin/sh\nprintf '%s\\n' \"$*\"\nwhile :; do sleep 1; done\n")
+            uv.chmod(0o700)
+            env["PATH"] = str(tool_dir) + os.pathsep + env["PATH"]
+            cli("start", "uv run bot.py", "--name=chino-bot", "--restart=never")
+            quoted = remember(rpc("process.get", {"id": "chino-bot"}))
+            assert quoted["config"]["command"] == str(uv), quoted
+            assert quoted["config"]["args"] == ["run", "bot.py"], quoted
+            cli("stop", "1")
+            cli("delete", "1", "--purge")
+
             assert "created" in cli("apply", str(path)).stdout
             first = remember(rpc("process.get", {"id": "api"}))
             first_pid = first["runtime"]["pid"]

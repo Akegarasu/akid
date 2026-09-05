@@ -17,7 +17,7 @@ import (
 func newListCommand(app *application) *cobra.Command {
 	return &cobra.Command{
 		Use:     "list",
-		Aliases: []string{"ls"},
+		Aliases: []string{"ls", "ps"},
 		Short:   "List managed processes",
 		Args:    cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
@@ -30,8 +30,8 @@ func newListCommand(app *application) *cobra.Command {
 				return err
 			}
 			writer := tabwriter.NewWriter(app.out, 0, 4, 2, ' ', 0)
-			fmt.Fprintln(writer, "NAME\tSTATUS\tPID\tRESTARTS\tCOMMAND")
-			for _, info := range list {
+			fmt.Fprintln(writer, "#\tNAME\tSTATUS\tPID\tRESTARTS\tCOMMAND")
+			for index, info := range list {
 				pid := "-"
 				if info.Runtime.PID > 0 {
 					pid = strconv.Itoa(info.Runtime.PID)
@@ -40,7 +40,7 @@ func newListCommand(app *application) *cobra.Command {
 				if !info.Runtime.NextRetryAt.IsZero() {
 					status = "backoff"
 				}
-				fmt.Fprintf(writer, "%s\t%s\t%s\t%d\t%s\n", info.Config.Name, status, pid, info.Runtime.RestartCount, info.Config.Command)
+				fmt.Fprintf(writer, "%d\t%s\t%s\t%s\t%d\t%s\n", index+1, info.Config.Name, status, pid, info.Runtime.RestartCount, info.Config.Command)
 			}
 			return writer.Flush()
 		},
@@ -57,8 +57,12 @@ func newStatusCommand(app *application) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			resolved, err := app.resolveProcessRef(cmd.Context(), client, args[0])
+			if err != nil {
+				return err
+			}
 			var info model.ProcessInfo
-			if err := app.call(cmd.Context(), client, "process.get", map[string]string{"id": args[0]}, &info); err != nil {
+			if err := app.call(cmd.Context(), client, "process.get", map[string]string{"id": resolved}, &info); err != nil {
 				return err
 			}
 			data, err := json.MarshalIndent(info, "", "  ")
@@ -81,7 +85,11 @@ func newActionCommand(app *application, action string) *cobra.Command {
 			if err != nil {
 				return err
 			}
-			return app.runProcessAction(cmd.Context(), client, action, args[0])
+			resolved, err := app.resolveProcessRef(cmd.Context(), client, args[0])
+			if err != nil {
+				return err
+			}
+			return app.runProcessAction(cmd.Context(), client, action, resolved)
 		},
 	}
 }
@@ -143,8 +151,12 @@ func newDeleteCommand(app *application) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			resolved, err := app.resolveProcessRef(cmd.Context(), client, args[0])
+			if err != nil {
+				return err
+			}
 			var result map[string]any
-			if err := app.call(cmd.Context(), client, "process.delete", map[string]any{"id": args[0], "purge": purge}, &result); err != nil {
+			if err := app.call(cmd.Context(), client, "process.delete", map[string]any{"id": resolved, "purge": purge}, &result); err != nil {
 				return err
 			}
 			fmt.Fprintf(app.out, "deleted %s\n", args[0])

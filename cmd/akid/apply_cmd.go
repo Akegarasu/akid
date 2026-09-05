@@ -28,6 +28,9 @@ func newApplyCommand(app *application) *cobra.Command {
 			if err != nil {
 				return err
 			}
+			for i := range configs {
+				configs[i].Command = resolveExecutable(configs[i].Command)
+			}
 			if check {
 				fmt.Fprintf(app.out, "valid configuration: %d processes\n", len(configs))
 				return nil

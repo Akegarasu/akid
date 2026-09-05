@@ -63,6 +63,7 @@ func processDetailRows(info model.ProcessInfo, metric model.ProcessMetrics, widt
 		}
 	}
 	rows := []string{
+		detailRow("ID", info.Config.ID, width),
 		detailRow("Status", statusStyleFor(info).Render(statusText(info)), width),
 		detailRow("Desired", string(info.Desired), width),
 		detailRow("PID", pid, width),
@@ -76,6 +77,10 @@ func processDetailRows(info model.ProcessInfo, metric model.ProcessMetrics, widt
 		detailRow("CWD", info.Config.Cwd, width),
 		detailRow("Restart", string(info.Config.Restart), width),
 		detailRow("Stop timeout", info.Config.StopTimeout().String(), width),
+		detailRow("Started", formatTime(info.Runtime.StartedAt), width),
+		detailRow("Stopped", formatTime(info.Runtime.StoppedAt), width),
+		detailRow("Log stdout", strconv.FormatUint(info.OutGeneration, 10), width),
+		detailRow("Log stderr", strconv.FormatUint(info.ErrGeneration, 10), width),
 		"",
 		titleStyle.Render("Environment"),
 	}
@@ -104,4 +109,11 @@ func detailRow(label, value string, width int) string {
 		value = "-"
 	}
 	return fitCell(fmt.Sprintf("%-14s %s", label, value), width)
+}
+
+func formatTime(value time.Time) string {
+	if value.IsZero() {
+		return "-"
+	}
+	return value.Local().Format("2006-01-02 15:04:05")
 }

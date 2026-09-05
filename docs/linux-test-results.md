@@ -201,9 +201,10 @@ checks are recorded in `diff-check-final.log`, `status-final.log`, and
 详见 `processes-before.log`、`processes-after.log` 和 `process-review.log`。
 原有 daemon 保留，未连接或修改其状态。本轮没有提交、推送、部署或实际安装用户服务。
 
-工作区包含新增实现/测试/示例/文档与既有文件修改；README 原本未跟踪，本轮仅同步
-新功能说明。`.agents/docs/akid-design.md` 和 TUI 评估文件的 SHA-256 与首次交接记录
-一致，原始文档保留。最终状态与源码指纹见 `status-final.log` 和 `workspace.sha256`。
+工作区包含新增实现/测试/示例/文档与既有文件修改；README 原本未跟踪，本轮增加了
+command string、ps/序号和 TUI 详情说明。`.agents/docs/akid-design.md` 和 TUI 评估
+文件的 SHA-256 与首次交接记录一致，原始文档保留；README 的旧交接哈希因这些更新
+预期不再匹配。最终状态与源码指纹见 `status-final.log` 和 `workspace.sha256`。
 
 受沙箱 socket 限制的检查已在沙箱外以普通用户完成。首次 unit 语法检查在沙箱内
 虽返回 0，但伴随 socket 权限诊断（`unit-verify.log`），因此最终结论使用沙箱外无
@@ -212,3 +213,26 @@ checks are recorded in `diff-check-final.log`, `status-final.log`, and
 尚未验证：真实 systemd enable/启动、用户登出、开机及 linger 行为；Windows 原生
 执行；其他内核/架构；真实交互终端的剪贴板。这些不计入“测试通过”的结论。
 可选 WebUI 与 prune 未进入本轮开发范围。
+
+## 后续 CLI/TUI 修复验证
+
+本轮随后加入了命令字符串和进程序号功能：`akid start "uv run bot.py"
+--name=chino-bot` 会拆分为 `command=/绝对路径/uv`、`args=["run", "bot.py"]`；
+CLI 在自己的 PATH 中解析裸命令，避免 daemon/systemd 环境缺少
+`$HOME/.local/bin` 时误报 `SPAWN_FAILED`。`list` 新增 `ps` 别名和 1 起始序号，
+数字引用可用于 status/start/stop/restart/delete/logs；TUI 详情补充 ID、时间、日志
+generation 等信息，args/cwd 继续显示。
+
+验证命令字符串回归使用临时 `uv` 替身和隔离 XDG 目录，实际输出为：
+
+```text
+chino-bot running pid=<test-pid>
+#  NAME       STATUS   PID    RESTARTS  COMMAND
+1  chino-bot  running  <test-pid>  0    /tmp/.../uv
+chino-bot stopped pid=<test-pid>
+deleted 1
+```
+
+随后执行的最终 `verify.sh` 仍通过全量测试、race、vet、构建、端到端脚本、
+Windows/Linux 交叉构建、gofmt 和 `git diff --check`。命令字符串解析、PATH 解析、
+TUI 详情字段各有单元测试；端到端脚本也覆盖相同的 quoted command 和序号停止/删除。

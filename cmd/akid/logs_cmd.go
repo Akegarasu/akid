@@ -51,6 +51,10 @@ func (a *application) runLogs(parent context.Context, id string, options logsOpt
 	if err != nil {
 		return err
 	}
+	id, err = a.resolveProcessRef(parent, client, id)
+	if err != nil {
+		return err
+	}
 	stream := model.LogStdout
 	if options.stderr {
 		stream = model.LogStderr

@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -51,8 +52,12 @@ func (a *application) runStart(ctx context.Context, args []string, options start
 		if len(args) != 1 {
 			return errors.New("--name is required when creating a process")
 		}
+		resolvedID, err := a.resolveProcessRef(ctx, client, args[0])
+		if err != nil {
+			return err
+		}
 		var info model.ProcessInfo
-		if err := a.call(ctx, client, "process.start", map[string]string{"id": args[0]}, &info); err != nil {
+		if err := a.call(ctx, client, "process.start", map[string]string{"id": resolvedID}, &info); err != nil {
 			return err
 		}
 		printOneLine(a.out, info)
@@ -73,6 +78,10 @@ func (a *application) runStart(ctx context.Context, args []string, options start
 		return err
 	}
 
+	commandArgs, err := expandStartCommand(args)
+	if err != nil {
+		return err
+	}
 	cwd, err := absoluteWorkingDirectory(options.cwd)
 	if err != nil {
 		return err
@@ -83,8 +92,8 @@ func (a *application) runStart(ctx context.Context, args []string, options start
 	}
 	cfg := model.ProcessConfig{
 		Name:          options.name,
-		Command:       args[0],
-		Args:          append([]string(nil), args[1:]...),
+		Command:       resolveExecutable(commandArgs[0]),
+		Args:          append([]string(nil), commandArgs[1:]...),
 		Cwd:           cwd,
 		Env:           environment,
 		Restart:       model.RestartPolicy(options.restart),
@@ -106,6 +115,30 @@ func (a *application) runStart(ctx context.Context, args []string, options start
 	}
 	printOneLine(a.out, started)
 	return nil
+}
+
+func (a *application) resolveProcessRef(ctx context.Context, client *protocol.Client, ref string) (string, error) {
+	var info model.ProcessInfo
+	if err := a.call(ctx, client, "process.get", map[string]string{"id": ref}, &info); err == nil {
+		return info.Config.ID, nil
+	} else {
+		var remote *protocol.RemoteError
+		if !errors.As(err, &remote) || remote.Code != manager.CodeNotFound {
+			return "", err
+		}
+	}
+	index, err := strconv.Atoi(ref)
+	if err != nil || index < 1 {
+		return ref, nil
+	}
+	var list []model.ProcessInfo
+	if err := a.call(ctx, client, "process.list", nil, &list); err != nil {
+		return "", err
+	}
+	if index > len(list) {
+		return "", &protocol.RemoteError{Code: manager.CodeNotFound, Message: fmt.Sprintf("process number %d not found", index)}
+	}
+	return list[index-1].Config.ID, nil
 }
 
 func parseEnvironment(values []string) (map[string]string, error) {

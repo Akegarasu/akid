@@ -41,15 +41,24 @@ go build -o akid ./cmd/akid
 # 创建并启动
 ./akid start ./server --name api --restart always
 
+# command strings are split with quote/backslash rules; bare executables are
+# resolved by the CLI (including tools installed in ~/.local/bin)
+./akid start "uv run bot.py" --name chino-bot --restart never
+
 # 以 “-” 开头的子进程参数必须放在 -- 后面
 ./akid start python worker.py --name worker -- --port 8080
 
 ./akid list
+./akid ps                         # list alias; output includes 1-based numbers
 ./akid status api
 ./akid restart api
 ./akid stop api
 ./akid delete api
 ./akid delete api --purge
+
+# numeric list entries can be used anywhere a process name or ID is accepted
+./akid stop 1
+./akid logs 1
 
 ./akid logs api
 ./akid logs api --stderr -n 200
@@ -114,6 +123,10 @@ unit 使用 `Restart=on-failure`，保存安装时的状态和 socket 目录配�
 - 日志搜索与复制：`/` 搜索，`n/N` 匹配跳转，`v/V` 字符/整行选择，`y` 复制，`w` 写入临时文件。
 - `Esc` 返回或取消选择，`q` 退出/返回。
 - `--mouse` 启用点击选择和滚轮浏览；默认关闭，以免妨碍终端原生文本选择。
+
+进程详情页（`i`）显示 ID、状态、PID、启动/停止时间、参数、cwd、重启策略、
+退出码、日志 generation、CPU/内存和环境变量。`ps`/`list` 的第一列是稳定的当前
+排序序号；序号可用于 `start`、`status`、`stop`、`restart`、`delete` 和 `logs`。
 
 ## 测试
 

@@ -80,6 +80,10 @@ go build -o akid ./cmd/akid
 ./akid apply --check akid.toml  # 只校验，不连接或启动 daemon
 ./akid apply akid.toml
 ./akid apply                  # 默认读取当前目录的 akid.toml
+./akid up akid.toml           # apply 的别名
+
+# fish 补全（可加入 ~/.config/fish/config.fish）
+./akid completion fish | source
 ```
 
 每个 `[[process]]` 使用唯一名称；支持 `command`、`args`、`cwd`、`restart`、

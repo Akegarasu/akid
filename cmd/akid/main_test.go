@@ -59,6 +59,29 @@ func TestApplyCheckDoesNotConnectToDaemon(t *testing.T) {
 	}
 }
 
+func TestApplyCommandHasUpAlias(t *testing.T) {
+	root := newRootCommand(newApplication(&bytes.Buffer{}, &bytes.Buffer{}))
+	apply, _, err := root.Find([]string{"up"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if apply.Name() != "apply" {
+		t.Fatalf("up resolved to %q", apply.Name())
+	}
+}
+
+func TestFishCompletion(t *testing.T) {
+	var out bytes.Buffer
+	root := newRootCommand(newApplication(&out, &out))
+	root.SetArgs([]string{"completion", "fish"})
+	if err := root.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(out.Bytes(), []byte("__akid_perform_completion")) {
+		t.Fatalf("fish completion script was not generated: %s", out.String())
+	}
+}
+
 func TestStartCommandRejectsUnknownFlags(t *testing.T) {
 	cmd := newStartCommand(newApplication(&bytes.Buffer{}, &bytes.Buffer{}))
 	if err := cmd.ParseFlags([]string{"./server", "--nanme", "api"}); err == nil {

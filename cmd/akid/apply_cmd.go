@@ -16,9 +16,10 @@ import (
 func newApplyCommand(app *application) *cobra.Command {
 	var check bool
 	cmd := &cobra.Command{
-		Use:   "apply [akid.toml]",
-		Short: "Apply process configuration from a TOML file",
-		Args:  cobra.MaximumNArgs(1),
+		Use:     "apply [akid.toml]",
+		Aliases: []string{"up"},
+		Short:   "Apply process configuration from a TOML file",
+		Args:    cobra.MaximumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			path := "akid.toml"
 			if len(args) == 1 {
